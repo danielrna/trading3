@@ -1,0 +1,60 @@
+{
+  "config": {
+    "SYMBOLS": [
+      "VOO",
+      "QQQ",
+      "IWM",
+      "DIA",
+      "XLK",
+      "XLF",
+      "XLV",
+      "XLY",
+      "XLP",
+      "XLI",
+      "XLU",
+      "XLE",
+      "XLRE",
+      "XLB"
+    ],
+    "BASE_SYMBOL": "VOO",
+    "YF_PERIOD": "max",
+    "START_CAPITAL": 100000.0,
+    "N_POSITIONS": 5,
+    "REBALANCE_FREQ": "M",
+    "LOOKBACK_DAYS": 252,
+    "SKIP_RECENT_DAYS": 21,
+    "VOL_LOOKBACK": 20,
+    "VOL_TARGET_ANNUAL": 0.12,
+    "MAX_WEIGHT_PER_ASSET": 0.25,
+    "SLIPPAGE_BPS": 1,
+    "FEE_BPS": 1,
+    "MIN_DOLLAR_VOL_AVG_30D": 2000000,
+    "MIN_DAILY_DOLLAR_VOL": 500000,
+    "QTY_DECIMALS": 4
+  },
+  "config_hash": "47d0390fe82b28831caab726d9431c9933172d6246756d4f1d8f4d0db38adf6e",
+  "stats": {
+    "CAGR": 0.09951188376552,
+    "TotalReturn": 3.198586271079116,
+    "MaxDD": -0.2383398935742177,
+    "Vol": 0.12936107807808128,
+    "Sharpe": 0.7994494729275946,
+    "MAR": 0.417520886970324
+  },
+  "universe": [
+    "VOO",
+    "QQQ",
+    "IWM",
+    "DIA",
+    "XLK",
+    "XLF",
+    "XLV",
+    "XLY",
+    "XLP",
+    "XLI",
+    "XLU",
+    "XLE",
+    "XLRE",
+    "XLB"
+  ]
+}
