@@ -27,17 +27,21 @@
       "ICLN",
       "TAN",
       "PBW",
-      "ARKK"
+      "ARKK",
+      "IEF",
+      "TLT",
+      "GLD",
+      "IAU",
+      "SHY"
     ],
     "BASE_SYMBOL": "VOO",
     "YF_PERIOD": "max",
     "START_CAPITAL": 100000.0,
     "UNIVERSE_MODE": "EXT",
-    "N_POSITIONS": 1,
     "LOOKBACKS": [
-      252,
-      126,
-      21
+      42,
+      14,
+      7
     ],
     "LOOKBACK_WEIGHTS": [
       0.4,
@@ -45,13 +49,20 @@
       0.2
     ],
     "SKIP_RECENT_DAYS": 0,
-    "REBALANCE_FREQ": "2W",
-    "INV_VOL": false,
-    "VOL_LOOKBACK": 20,
-    "MAX_WEIGHT_PER_ASSET": 0.6,
-    "ABSOLUTE_MOMENTUM": true,
-    "MA_FILTER": false,
-    "MA_WINDOW": 200,
+    "REBALANCE_FREQ": "D",
+    "N_POSITIONS_BASE": 1,
+    "ALLOW_TWO_WHEN_SPREAD": true,
+    "ALLOW_THREE_WHEN_SPREAD": true,
+    "SPREAD_THRESHOLD1": 0.01,
+    "SPREAD_THRESHOLD2": 0.0075,
+    "ABS_MOM_GATE_BASE": 0.003,
+    "ABS_MOM_GATE_SCALE_VOL": false,
+    "MAX_WEIGHT_MIN": 0.8,
+    "MAX_WEIGHT_MAX": 1.0,
+    "CASH_BUFFER_MIN": 0.02,
+    "CASH_BUFFER_MAX": 0.1,
+    "DEFENSIVE_OVERRIDE": true,
+    "DEFENSIVE_ASSET": "IAU",
     "SLIPPAGE_BPS": 1,
     "FEE_BPS": 1,
     "MIN_DOLLAR_VOL_AVG_30D": 2000000,
@@ -59,14 +70,14 @@
     "QTY_DECIMALS": 4,
     "BENCHMARK_MODE": "VOO"
   },
-  "config_hash": "547a0a2566b7bb0d41186d5225f2cc1e5d1c279838722a1d44adc09a398109bf",
+  "config_hash": "a79c54e3c6fb7fc5f6b9d75226b940dbaec4c275404eed561b34c2abae2152fa",
   "stats_strategy": {
-    "CAGR": 0.2952228932098151,
-    "TotalReturn": 49.013331962950005,
-    "MaxDD": -0.4333278896948206,
-    "Vol": 0.3041129083727411,
-    "Sharpe": 1.0049331503526304,
-    "MAR": 0.6812921582724145
+    "CAGR": 0.3144981422692894,
+    "TotalReturn": 61.53347398338802,
+    "MaxDD": -0.19331666015986737,
+    "Vol": 0.2046793000214113,
+    "Sharpe": 1.4413218821575327,
+    "MAR": 1.6268548298382994
   },
   "stats_benchmark": {
     "CAGR": 0.12754706819681783,
@@ -99,6 +110,11 @@
     "IBB",
     "XLC",
     "TAN",
-    "ARKK"
+    "ARKK",
+    "IEF",
+    "TLT",
+    "GLD",
+    "IAU",
+    "SHY"
   ]
 }
