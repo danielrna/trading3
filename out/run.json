@@ -1,6 +1,6 @@
 {
   "config": {
-    "SYMBOLS": [
+    "UNIVERSE_BASE": [
       "VOO",
       "QQQ",
       "IWM",
@@ -16,37 +16,65 @@
       "XLRE",
       "XLB"
     ],
+    "UNIVERSE_EXT": [
+      "SMH",
+      "SOXX",
+      "IGV",
+      "FDN",
+      "XBI",
+      "IBB",
+      "XLC",
+      "ICLN",
+      "TAN",
+      "PBW",
+      "ARKK"
+    ],
     "BASE_SYMBOL": "VOO",
     "YF_PERIOD": "max",
     "START_CAPITAL": 100000.0,
-    "N_POSITIONS": 5,
-    "LOOKBACK_DAYS": 252,
-    "SKIP_RECENT_DAYS": 21,
+    "UNIVERSE_MODE": "EXT",
+    "N_POSITIONS": 1,
+    "LOOKBACKS": [
+      252,
+      126,
+      21
+    ],
+    "LOOKBACK_WEIGHTS": [
+      0.4,
+      0.4,
+      0.2
+    ],
+    "SKIP_RECENT_DAYS": 0,
+    "REBALANCE_FREQ": "2W",
+    "INV_VOL": false,
     "VOL_LOOKBACK": 20,
-    "MAX_WEIGHT_PER_ASSET": 0.25,
+    "MAX_WEIGHT_PER_ASSET": 0.6,
+    "ABSOLUTE_MOMENTUM": true,
+    "MA_FILTER": false,
+    "MA_WINDOW": 200,
     "SLIPPAGE_BPS": 1,
     "FEE_BPS": 1,
     "MIN_DOLLAR_VOL_AVG_30D": 2000000,
     "MIN_DAILY_DOLLAR_VOL": 500000,
     "QTY_DECIMALS": 4,
-    "BENCHMARK_MODE": "EQUAL"
+    "BENCHMARK_MODE": "VOO"
   },
-  "config_hash": "6788ce389882d469a3a57d8b15110e974879c9dc910c98d2af2aded49556ab07",
+  "config_hash": "547a0a2566b7bb0d41186d5225f2cc1e5d1c279838722a1d44adc09a398109bf",
   "stats_strategy": {
-    "CAGR": 0.09951188376552,
-    "TotalReturn": 3.198586271079116,
-    "MaxDD": -0.2383398935742177,
-    "Vol": 0.12936107807808128,
-    "Sharpe": 0.7994494729275946,
-    "MAR": 0.417520886970324
+    "CAGR": 0.2952228932098151,
+    "TotalReturn": 49.013331962950005,
+    "MaxDD": -0.4333278896948206,
+    "Vol": 0.3041129083727411,
+    "Sharpe": 1.0049331503526304,
+    "MAR": 0.6812921582724145
   },
   "stats_benchmark": {
-    "CAGR": 0.12143269093750853,
-    "TotalReturn": 4.6593228814404934,
-    "MaxDD": -0.3453499815494988,
-    "Vol": 0.17197363187161982,
-    "Sharpe": 0.7539275788719497,
-    "MAR": 0.3516221150285588
+    "CAGR": 0.12754706819681783,
+    "TotalReturn": 5.144393897237356,
+    "MaxDD": -0.34301429483265344,
+    "Vol": 0.17179928154082527,
+    "Sharpe": 0.7862099302247187,
+    "MAR": 0.37184184483927785
   },
   "universe": [
     "VOO",
@@ -62,6 +90,15 @@
     "XLU",
     "XLE",
     "XLRE",
-    "XLB"
+    "XLB",
+    "SMH",
+    "SOXX",
+    "IGV",
+    "FDN",
+    "XBI",
+    "IBB",
+    "XLC",
+    "TAN",
+    "ARKK"
   ]
 }
