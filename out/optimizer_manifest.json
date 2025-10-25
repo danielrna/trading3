@@ -1,30 +1,33 @@
 {
   "best_params": {
-    "universe": "EXT",
     "n_positions": 1,
     "lookbacks": [
       252,
-      126,
+      84,
       21
     ],
     "weights": [
-      0.4,
-      0.4,
-      0.2
+      0.6,
+      0.3,
+      0.1
     ],
     "skip_recent": 0,
-    "rebalance": "2W",
-    "inv_vol": false,
-    "max_weight": 0.6,
-    "ma_filter": false
+    "rebalance": "M",
+    "inv_vol": true,
+    "max_weight": 0.4,
+    "ma_filter": false,
+    "regime": "both",
+    "hedge": "gold",
+    "allow_short": false,
+    "leverage": 1.0
   },
   "best_stats": {
-    "CAGR": 0.2952228932098151,
-    "TotalReturn": 49.013331962950005,
-    "MaxDD": -0.4333278896948206,
-    "Vol": 0.3041129083727411,
-    "Sharpe": 1.0049331503526304,
-    "MAR": 0.6812921582724145
+    "CAGR": 0.1897450865179766,
+    "TotalReturn": 12.840654088238336,
+    "MaxDD": -0.4333278931911273,
+    "Vol": 0.2863141249264428,
+    "Sharpe": 0.751114804889478,
+    "MAR": 0.4378787737864039
   },
   "best_benchmark": {
     "CAGR": 0.12754706819681783,
@@ -34,5 +37,6 @@
     "Sharpe": 0.7862099302247187,
     "MAR": 0.37184184483927785
   },
-  "generated_at": "2025-10-25T10:23:26.424422+00:00"
+  "best_fitness": 2.9364071492259365,
+  "generated_at": "2025-10-25T13:12:46.127841+00:00"
 }

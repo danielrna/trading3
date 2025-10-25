@@ -1,0 +1,42 @@
+{
+  "best_params": {
+    "n_positions": 2,
+    "lookbacks": [
+      252,
+      126,
+      63
+    ],
+    "weights": [
+      0.4,
+      0.4,
+      0.2
+    ],
+    "skip_recent": 21,
+    "rebalance": "M",
+    "inv_vol": false,
+    "max_weight": 0.6,
+    "ma200_filter": false,
+    "abs_mom_gate": 0.0,
+    "regime": "none",
+    "hedge": "tlt",
+    "allow_short": false,
+    "leverage": 1.0
+  },
+  "best_stats": {
+    "CAGR": 0.23201773031008988,
+    "TotalReturn": 22.46824966375161,
+    "MaxDD": -0.3514506475986837,
+    "Vol": 0.27048011172276654,
+    "Sharpe": 0.9084568352306011,
+    "MAR": 0.6601715828249873
+  },
+  "best_benchmark": {
+    "CAGR": 0.12754706819681783,
+    "TotalReturn": 5.144393897237356,
+    "MaxDD": -0.34301429483265344,
+    "Vol": 0.17179928154082527,
+    "Sharpe": 0.7862099302247187,
+    "MAR": 0.37184184483927785
+  },
+  "generated_at": "2025-10-25T14:35:25.934940+00:00"
+}
