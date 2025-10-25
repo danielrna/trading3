@@ -1,4 +1,4 @@
-# file: etf_cross_sectional_momentum_v1.py
+# file: etf_cross_sectional_momentum_v2.py
 # Python 3.10+
 # Deps: pandas, numpy, yfinance, matplotlib (optional)
 
@@ -34,33 +34,33 @@ SYMBOLS: List[str] = [
     "XLB",  # Materials
     "XLY",  # (duplicate guarded below)
 ]
-# Guard duplicates
 SYMBOLS = list(dict.fromkeys(SYMBOLS))
 
-BASE_SYMBOL = "VOO"              # Benchmark for optional filters/stats only
-YF_PERIOD = "max"                # Use the max to allow long lookbacks
+BASE_SYMBOL = "VOO"              # used for signals/stats
+YF_PERIOD = "max"
 
 START_CAPITAL = 100_000.0
-N_POSITIONS = 5                  # Top-N momentum holdings
-REBALANCE_FREQ = "M"             # Monthly rebalance
-LOOKBACK_DAYS = 252              # 12-month momentum lookback window
-SKIP_RECENT_DAYS = 21            # 1-month skip (12-1 momentum)
+N_POSITIONS = 5
+LOOKBACK_DAYS = 252              # 12-month momentum
+SKIP_RECENT_DAYS = 21            # 1-month skip (12-1)
 MIN_HISTORY_DAYS = LOOKBACK_DAYS + SKIP_RECENT_DAYS + 10
 
-VOL_LOOKBACK = 20                # Realized vol window (trading days)
-VOL_TARGET_ANNUAL = 0.12         # Portfolio vol target (not enforced hard, used for scaling weights)
-MAX_WEIGHT_PER_ASSET = 0.25      # Cap per asset after scaling
+VOL_LOOKBACK = 20
+MAX_WEIGHT_PER_ASSET = 0.25
 MIN_WEIGHT_PER_ASSET = 0.0
 
 # Costs
-SLIPPAGE_BPS = 1                 # Per trade side
-FEE_BPS = 1                      # Per trade side
+SLIPPAGE_BPS = 1                 # per side
+FEE_BPS = 1                      # per side
 
-# Liquidity guards (ETFs are liquid; keep conservative)
+# Liquidity guards
 MIN_DOLLAR_VOL_AVG_30D = 2_000_000
 MIN_DAILY_DOLLAR_VOL = 500_000
 
-QTY_DECIMALS = 4                 # ETF quantity precision
+QTY_DECIMALS = 4
+
+# Benchmark mode: "VOO" | "QQQ" | "EQUAL" | "TOP5_STATIC"
+BENCHMARK_MODE = "EQUAL"
 
 OUT_DIR = "./out"
 
@@ -98,7 +98,6 @@ def fetch_data(symbols: List[str], period: str = YF_PERIOD) -> Dict[str, pd.Data
         s = symbols[0]
         data[s] = clean_df(raw)
 
-    # Align calendars to base symbol
     base = data.get(BASE_SYMBOL, None)
     if base is None:
         raise ValueError(f"BASE_SYMBOL {BASE_SYMBOL} must be in SYMBOLS and returned by Yahoo")
@@ -106,7 +105,6 @@ def fetch_data(symbols: List[str], period: str = YF_PERIOD) -> Dict[str, pd.Data
     for s in list(data.keys()):
         data[s] = data[s].reindex(base_idx).dropna()
 
-    # Remove series with insufficient history
     data = {s: df for s, df in data.items() if len(df) >= MIN_HISTORY_DAYS}
     if BASE_SYMBOL not in data:
         raise ValueError(f"BASE_SYMBOL {BASE_SYMBOL} has insufficient history after alignment")
@@ -172,7 +170,6 @@ def compute_inv_vol_weights(close: pd.DataFrame) -> pd.DataFrame:
     return inv
 
 def monthly_rebalance_dates_from_close(close: pd.DataFrame) -> pd.DatetimeIndex:
-    # Last available trading day in each calendar month present in `close`
     last_per_month = close.index.to_series().groupby(close.index.to_period("M")).max()
     return pd.DatetimeIndex(last_per_month.values)
 
@@ -326,6 +323,64 @@ def run_backtest(data: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame, pd.DataFr
 
     return equity_df, exposures, trades_df
 
+# -------------------------------- Benchmark ------------------------------ #
+
+def compute_benchmark_equity(
+        mode: str,
+        data: Dict[str, pd.DataFrame],
+        idx: pd.DatetimeIndex,
+        close: Optional[pd.DataFrame] = None,
+        mom: Optional[pd.DataFrame] = None
+) -> pd.Series:
+    mode = mode.upper().strip()
+    if mode == "VOO":
+        sym = "VOO"
+        if sym not in data:
+            raise ValueError("VOO data not available for benchmark")
+        c = data[sym]["close"].reindex(idx).dropna()
+        base = c.iloc[0]
+        return (START_CAPITAL * (c / base)).reindex(idx).ffill()
+
+    if mode == "QQQ":
+        sym = "QQQ"
+        if sym not in data:
+            raise ValueError("QQQ data not available for benchmark")
+        c = data[sym]["close"].reindex(idx).dropna()
+        base = c.iloc[0]
+        return (START_CAPITAL * (c / base)).reindex(idx).ffill()
+
+    if mode == "EQUAL":
+        if close is None:
+            close = pd.DataFrame({s: df["close"] for s, df in data.items()}, index=idx).dropna(how="all")
+        valid_cols = [c for c in close.columns if close[c].notna().sum() == len(close)]
+        if not valid_cols:
+            raise ValueError("No fully aligned series for equal-weight benchmark")
+        norm = close[valid_cols] / close[valid_cols].iloc[0]
+        eq = START_CAPITAL * norm.mean(axis=1)
+        return eq.reindex(idx).ffill()
+
+    if mode == "TOP5_STATIC":
+        if close is None:
+            close = pd.DataFrame({s: df["close"] for s, df in data.items()}, index=idx).dropna(how="all")
+        if mom is None:
+            mom = trailing_return(close, LOOKBACK_DAYS, SKIP_RECENT_DAYS)
+        # pick the first date where momentum exists
+        first_valid = mom.dropna(how="all").index.min()
+        if pd.isna(first_valid):
+            raise ValueError("Insufficient history to form TOP5_STATIC benchmark")
+        m = mom.loc[first_valid].dropna().sort_values(ascending=False)
+        top = list(m.index[:N_POSITIONS])
+        sub = close[top].dropna()
+        if len(sub) == 0:
+            raise ValueError("No valid series for TOP5_STATIC benchmark")
+        weights = np.repeat(1.0 / len(top), len(top))
+        base = sub.iloc[0]
+        rel = sub.divide(base)
+        eq = START_CAPITAL * (rel @ weights)
+        return eq.reindex(idx).ffill()
+
+    raise ValueError(f"Unknown BENCHMARK_MODE: {mode}")
+
 # -------------------------------- Metrics -------------------------------- #
 
 def compute_stats(equity: pd.Series) -> Dict[str, float]:
@@ -353,24 +408,29 @@ def _config_dict() -> Dict[str, object]:
         "YF_PERIOD": YF_PERIOD,
         "START_CAPITAL": START_CAPITAL,
         "N_POSITIONS": N_POSITIONS,
-        "REBALANCE_FREQ": REBALANCE_FREQ,
         "LOOKBACK_DAYS": LOOKBACK_DAYS,
         "SKIP_RECENT_DAYS": SKIP_RECENT_DAYS,
         "VOL_LOOKBACK": VOL_LOOKBACK,
-        "VOL_TARGET_ANNUAL": VOL_TARGET_ANNUAL,
         "MAX_WEIGHT_PER_ASSET": MAX_WEIGHT_PER_ASSET,
         "SLIPPAGE_BPS": SLIPPAGE_BPS,
         "FEE_BPS": FEE_BPS,
         "MIN_DOLLAR_VOL_AVG_30D": MIN_DOLLAR_VOL_AVG_30D,
         "MIN_DAILY_DOLLAR_VOL": MIN_DAILY_DOLLAR_VOL,
         "QTY_DECIMALS": QTY_DECIMALS,
+        "BENCHMARK_MODE": BENCHMARK_MODE,
     }
 
-def _write_run_manifest(stats: Dict[str, float], syms: List[str]) -> None:
+def _write_run_manifest(stats: Dict[str, float], bench_stats: Dict[str, float], syms: List[str]) -> None:
     cfg = _config_dict()
     cfg_json = json.dumps(cfg, sort_keys=True).encode("utf-8")
     cfg_hash = hashlib.sha256(cfg_json).hexdigest()
-    manifest = {"config": cfg, "config_hash": cfg_hash, "stats": stats, "universe": syms}
+    manifest = {
+        "config": cfg,
+        "config_hash": cfg_hash,
+        "stats_strategy": stats,
+        "stats_benchmark": bench_stats,
+        "universe": syms
+    }
     os.makedirs(OUT_DIR, exist_ok=True)
     with open(f"{OUT_DIR}/run.json", "w") as f:
         json.dump(manifest, f, indent=2)
@@ -379,28 +439,51 @@ def _write_run_manifest(stats: Dict[str, float], syms: List[str]) -> None:
 
 def main():
     data = fetch_data(SYMBOLS, period=YF_PERIOD)
+
+    # Strategy
     equity_df, expo_df, trades_df = run_backtest(data)
     stats = compute_stats(equity_df["equity"])
 
-    print("Backtest Stats:")
+    # Build aligned price panel for benchmark construction
+    idx = equity_df.index
+    close_panel = pd.DataFrame({s: df["close"] for s, df in data.items()}, index=idx).dropna(how="all")
+    mom_panel = trailing_return(close_panel, LOOKBACK_DAYS, SKIP_RECENT_DAYS)
+
+    # Benchmark
+    bench_series = compute_benchmark_equity(BENCHMARK_MODE, data, idx, close_panel, mom_panel)
+    equity_df["benchmark"] = bench_series
+
+    bench_stats = compute_stats(equity_df["benchmark"])
+
+    # Output
+    print("Backtest Stats (Strategy):")
     for k, v in stats.items():
-        if isinstance(v, float) and not np.isnan(v):
-            print(f"{k}: {v:.4%}")
-        else:
-            print(f"{k}: {v}")
+        print(f"{k}: {v:.4%}" if isinstance(v, float) and not np.isnan(v) else f"{k}: {v}")
+
+    print(f"\nBenchmark ({BENCHMARK_MODE}) Stats:")
+    for k, v in bench_stats.items():
+        print(f"{k}: {v:.4%}" if isinstance(v, float) and not np.isnan(v) else f"{k}: {v}")
 
     os.makedirs(OUT_DIR, exist_ok=True)
-    equity_df.to_csv(f"{OUT_DIR}/equity_curve.csv")
+    equity_df.to_csv(f"{OUT_DIR}/equity_curve.csv")            # now includes 'equity' and 'benchmark'
     expo_df.to_csv(f"{OUT_DIR}/exposures.csv")
     trades_df.to_csv(f"{OUT_DIR}/trades.csv", index=False)
-    _write_run_manifest(stats, SYMBOLS)
-    print(f"Saved: {OUT_DIR}/equity_curve.csv, {OUT_DIR}/exposures.csv, {OUT_DIR}/trades.csv, {OUT_DIR}/run.json")
 
+    compare_df = pd.DataFrame({
+        "strategy": equity_df["equity"],
+        "benchmark": equity_df["benchmark"]
+    }, index=equity_df.index)
+    compare_df.to_csv(f"{OUT_DIR}/compare_equity.csv")
+
+    _write_run_manifest(stats, bench_stats, SYMBOLS)
+    print(f"\nSaved: {OUT_DIR}/equity_curve.csv, {OUT_DIR}/compare_equity.csv, {OUT_DIR}/exposures.csv, {OUT_DIR}/trades.csv, {OUT_DIR}/run.json")
+
+    # Plot
     try:
         import matplotlib.pyplot as plt
         plt.figure()
-        equity_df["equity"].plot()
-        plt.title(f"Cross-Sectional Momentum (Top {N_POSITIONS}, {LOOKBACK_DAYS}-{SKIP_RECENT_DAYS})")
+        equity_df[["equity", "benchmark"]].plot()
+        plt.title(f"Strategy vs Benchmark ({BENCHMARK_MODE})")
         plt.xlabel("Date")
         plt.ylabel("Equity")
         plt.tight_layout()

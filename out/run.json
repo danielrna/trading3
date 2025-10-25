@@ -20,26 +20,33 @@
     "YF_PERIOD": "max",
     "START_CAPITAL": 100000.0,
     "N_POSITIONS": 5,
-    "REBALANCE_FREQ": "M",
     "LOOKBACK_DAYS": 252,
     "SKIP_RECENT_DAYS": 21,
     "VOL_LOOKBACK": 20,
-    "VOL_TARGET_ANNUAL": 0.12,
     "MAX_WEIGHT_PER_ASSET": 0.25,
     "SLIPPAGE_BPS": 1,
     "FEE_BPS": 1,
     "MIN_DOLLAR_VOL_AVG_30D": 2000000,
     "MIN_DAILY_DOLLAR_VOL": 500000,
-    "QTY_DECIMALS": 4
+    "QTY_DECIMALS": 4,
+    "BENCHMARK_MODE": "EQUAL"
   },
-  "config_hash": "47d0390fe82b28831caab726d9431c9933172d6246756d4f1d8f4d0db38adf6e",
-  "stats": {
+  "config_hash": "6788ce389882d469a3a57d8b15110e974879c9dc910c98d2af2aded49556ab07",
+  "stats_strategy": {
     "CAGR": 0.09951188376552,
     "TotalReturn": 3.198586271079116,
     "MaxDD": -0.2383398935742177,
     "Vol": 0.12936107807808128,
     "Sharpe": 0.7994494729275946,
     "MAR": 0.417520886970324
+  },
+  "stats_benchmark": {
+    "CAGR": 0.12143269093750853,
+    "TotalReturn": 4.6593228814404934,
+    "MaxDD": -0.3453499815494988,
+    "Vol": 0.17197363187161982,
+    "Sharpe": 0.7539275788719497,
+    "MAR": 0.3516221150285588
   },
   "universe": [
     "VOO",
