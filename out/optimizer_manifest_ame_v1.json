@@ -1,0 +1,45 @@
+{
+  "best_params": {
+    "lookbacks": [
+      84,
+      21,
+      7
+    ],
+    "weights": [
+      0.4,
+      0.4,
+      0.2
+    ],
+    "skip_recent": 0,
+    "rebalance": "D",
+    "n_positions_base": 1,
+    "allow_two_when_spread": true,
+    "spread_threshold": 0.015,
+    "abs_mom_gate_base": 0.005,
+    "abs_mom_gate_scale_vol": false,
+    "max_weight_min": 0.8,
+    "max_weight_max": 0.9,
+    "cash_buffer_min": 0.05,
+    "cash_buffer_max": 0.15,
+    "use_regime": true,
+    "slow_down_in_chop": false,
+    "defensive_override": true,
+    "defensive_asset": "IAU"
+  },
+  "best_stats": {
+    "CAGR": 0.2825607057012325,
+    "TotalReturn": 42.10806047961239,
+    "MaxDD": -0.2715278734021608,
+    "Vol": 0.20463353217152186,
+    "Sharpe": 1.3210782582977556,
+    "MAR": 1.0406324115488907
+  },
+  "best_benchmark": {
+    "CAGR": 0.12754706819681783,
+    "TotalReturn": 5.144393897237356,
+    "MaxDD": -0.34301429483265344,
+    "Vol": 0.17179928154082527,
+    "Sharpe": 0.7862099302247187,
+    "MAR": 0.37184184483927785
+  }
+}
