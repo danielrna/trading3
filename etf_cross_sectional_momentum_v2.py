@@ -22,27 +22,41 @@ UNIVERSE_BASE: List[str] = [
     "VOO","QQQ","IWM","DIA","XLK","XLF","XLV","XLY","XLP","XLI","XLU","XLE","XLRE","XLB"
 ]
 UNIVERSE_EXT: List[str] = [
-    "SMH","SOXX","IGV","FDN","XBI","IBB","XLC","ICLN","TAN","PBW","ARKK"
+    "SMH","SOXX","IGV","FDN","XBI","IBB","XLC","ICLN","TAN","PBW","ARKK","IEF","TLT","GLD","IAU","SHY"
 ]
 
 BASE_SYMBOL = "VOO"                  # benchmark symbol and calendar anchor
 YF_PERIOD = "max"
+START_CAPITAL = 1000.0
+OUT_DIR = "./out"
 
-START_CAPITAL = 100_000.0
-
-# ---- Optimizer-equivalent knobs ----
+# ----------------- AME_V3 (light) — Best Params (frozen) ----------------- #
 UNIVERSE_MODE = "EXT"                # "BASE" or "EXT"
-N_POSITIONS = 1                      # 1..N
-LOOKBACKS: Tuple[int,int,int] = (252, 126, 21)  # composite momentum windows
-LOOKBACK_WEIGHTS: Tuple[float,float,float] = (0.4, 0.4, 0.2)  # must sum ~1.0
-SKIP_RECENT_DAYS = 0                 # 0 or 21 (12-1)
-REBALANCE_FREQ = "2W"                # "W" | "2W" | "M"
-INV_VOL = False                      # inverse-volatility scaling on/off
-VOL_LOOKBACK = 20                    # realized vol window
-MAX_WEIGHT_PER_ASSET = 0.60          # cap per asset
-ABSOLUTE_MOMENTUM = True             # gate: score must be > 0
-MA_FILTER = False                    # gate: price > MA200
-MA_WINDOW = 200
+LOOKBACKS: Tuple[int,int,int] = (42, 14, 7)
+LOOKBACK_WEIGHTS: Tuple[float,float,float] = (0.4, 0.4, 0.2)
+SKIP_RECENT_DAYS = 0
+REBALANCE_FREQ = "D"                 # "D" | "W" | "2W" | "M"
+
+N_POSITIONS_BASE = 1
+ALLOW_TWO_WHEN_SPREAD = True
+ALLOW_THREE_WHEN_SPREAD = True
+SPREAD_THRESHOLD1 = 0.01             # enable #2 if top1 - top2 >= 1.0%
+SPREAD_THRESHOLD2 = 0.0075           # enable #3 if top2 - top3 >= 0.75%
+
+ABS_MOM_GATE_BASE = 0.003            # 0.30% absolute gate
+ABS_MOM_GATE_SCALE_VOL = False       # scaling disabled (frozen)
+
+MAX_WEIGHT_MIN = 0.80                # dynamic cap floor (via spread)
+MAX_WEIGHT_MAX = 1.00                # dynamic cap ceiling (no extra boost)
+
+CASH_BUFFER_MIN = 0.02               # 2% cash when spread large (confident)
+CASH_BUFFER_MAX = 0.10               # 10% cash when spread tiny (cautious)
+
+USE_REGIME = False                   # regime disabled (frozen)
+SLOW_DOWN_IN_CHOP = False            # NA when regime disabled
+
+DEFENSIVE_OVERRIDE = True            # fallback when nothing passes gate
+DEFENSIVE_ASSET = "IAU"
 
 # Costs (per-side)
 SLIPPAGE_BPS = 1
@@ -53,10 +67,8 @@ QTY_DECIMALS = 4
 MIN_DOLLAR_VOL_AVG_30D = 2_000_000
 MIN_DAILY_DOLLAR_VOL = 500_000
 
-# Benchmark: "VOO" | "QQQ" | "EQUAL" | "TOP5_STATIC"
+# Benchmark: "VOO" | "QQQ" | "EQUAL"
 BENCHMARK_MODE = "VOO"
-
-OUT_DIR = "./out"
 
 # ============================== Data Layer =============================== #
 
@@ -78,8 +90,8 @@ def fetch_data(symbols: List[str], period: str = YF_PERIOD) -> Dict[str, pd.Data
         }).copy()
         out = out.dropna(subset=["open", "high", "low", "close", "volume"])
         bad = (
-                (out["open"] <= 0) | (out["high"] <= 0) |
-                (out["low"] <= 0)  | (out["close"] <= 0) | (out["volume"] < 0)
+                (out["open"] <= 0) | (out["high"] <= 0) | (out["low"] <= 0) |
+                (out["close"] <= 0) | (out["volume"] < 0)
         )
         out = out[~bad]
         out.index.name = "date"
@@ -124,10 +136,6 @@ def trailing_return(close: pd.Series, lookback: int, skip: int) -> pd.Series:
     ref = past.shift(lookback)
     return past.divide(ref) - 1.0
 
-def realized_vol(close: pd.Series, window: int) -> pd.Series:
-    r = close.pct_change()
-    return r.rolling(window, min_periods=window).std() * np.sqrt(252)
-
 def composite_momentum(close: pd.DataFrame,
                        lookbacks: Tuple[int,int,int],
                        weights: Tuple[float,float,float],
@@ -138,12 +146,6 @@ def composite_momentum(close: pd.DataFrame,
     m2 = trailing_return(close, l2, skip)
     m3 = trailing_return(close, l3, skip)
     return w1 * m1 + w2 * m2 + w3 * m3
-
-def inverse_volatility_matrix(close: pd.DataFrame, window: int) -> pd.DataFrame:
-    vol = close.apply(lambda s: realized_vol(s, window))
-    with np.errstate(divide="ignore", invalid="ignore"):
-        inv = 1.0 / vol.replace(0, np.nan)
-    return inv
 
 # ============================== Execution ================================ #
 
@@ -171,82 +173,95 @@ def build_panel(data: Dict[str, pd.DataFrame]) -> Tuple[pd.DatetimeIndex, pd.Dat
 
 def last_day_per_period(idx: pd.DatetimeIndex, freq: str) -> pd.DatetimeIndex:
     f = freq.upper()
+    s = idx.to_series()
     if f == "M":
-        g = idx.to_series().groupby(idx.to_period("M")).max()
+        g = s.groupby(idx.to_period("M")).max()
     elif f == "W":
-        g = idx.to_series().groupby(idx.to_period("W")).max()
+        g = s.groupby(idx.to_period("W")).max()
     elif f == "2W":
-        weekly_last = idx.to_series().groupby(idx.to_period("W")).max()
-        g = weekly_last.iloc[::2]
+        g = s.groupby(idx.to_period("W")).max().iloc[::2]
+    elif f == "D":
+        g = s
     else:
-        raise ValueError("REBALANCE_FREQ must be 'W','2W','M'")
+        raise ValueError("REBALANCE_FREQ must be 'D','W','2W','M'")
     return pd.DatetimeIndex(g.values)
 
-def compute_weights(
+def dynamic_caps(spread_top12: float) -> Tuple[float, float]:
+    """
+    Map spread in [0,10%] to:
+      - weight cap in [MAX_WEIGHT_MIN, MAX_WEIGHT_MAX]
+      - cash buffer in [CASH_BUFFER_MAX -> CASH_BUFFER_MIN] (inverse relation)
+    """
+    sp = max(0.0, min(0.10, spread_top12))
+    frac = sp / 0.10
+    cap = MAX_WEIGHT_MIN + (MAX_WEIGHT_MAX - MAX_WEIGHT_MIN) * frac
+    cash_buf = CASH_BUFFER_MAX - (CASH_BUFFER_MAX - CASH_BUFFER_MIN) * frac
+    return min(MAX_WEIGHT_MAX, cap), max(0.0, min(0.50, cash_buf))
+
+def compute_target_weights(
         dt: pd.Timestamp,
         close: pd.DataFrame,
-        mom: pd.DataFrame,
-        inv_vol: Optional[pd.DataFrame],
-        max_w: float,
-        absolute_mom: bool,
-        ma_filter: bool,
-        ma200: Optional[pd.DataFrame],
-        n_positions: int
-) -> pd.Series:
-    # Eligibility gate
-    eligible: List[Tuple[str, float]] = []
-    for s in close.columns:
-        sc = float(mom.loc[dt, s]) if s in mom.columns else np.nan
-        if not np.isfinite(sc):
-            continue
-        if absolute_mom and sc <= 0:
-            continue
-        if ma_filter:
-            m = float(ma200.loc[dt, s]) if (ma200 is not None and s in ma200.columns) else np.nan
-            if not np.isfinite(m) or float(close.loc[dt, s]) <= m:
-                continue
-        eligible.append((s, sc))
+        mom: pd.DataFrame
+) -> Tuple[Dict[str, float], float]:
+    """
+    Returns target weights and cash buffer based on:
+      - Absolute momentum gate
+      - Spread-based expansion to up to 3 positions
+      - Dynamic caps and dynamic cash buffer by spread
+    """
+    scores = mom.loc[dt].dropna().copy()
 
+    # Exclude defensive assets from selection universe
+    defensives = {"TLT", "IEF", "GLD", "IAU", "SHY"}
+    scores = scores[[s for s in scores.index if s not in defensives and s in close.columns]]
+
+    # Absolute gate
+    gate = ABS_MOM_GATE_BASE if not ABS_MOM_GATE_SCALE_VOL else ABS_MOM_GATE_BASE  # scaling disabled
+    eligible = [(s, float(sc)) for s, sc in scores.items() if np.isfinite(sc) and sc > gate]
     if not eligible:
-        return pd.Series(dtype=float)
+        return {}, CASH_BUFFER_MAX
 
     eligible.sort(key=lambda x: x[1], reverse=True)
-    top = [s for s, _ in eligible[:n_positions]]
+    chosen: List[str] = [eligible[0][0]]
 
-    # Base raw weights: momentum * inverse-vol (if enabled)
-    raw: Dict[str, float] = {}
-    for s in top:
-        sc = float(mom.loc[dt, s])
-        iv = float(inv_vol.loc[dt, s]) if inv_vol is not None and s in inv_vol.columns else 1.0
-        iv = max(iv, 0.0)
-        sc = max(sc, 0.0)
-        raw[s] = sc * (iv if INV_VOL else 1.0)
+    # Spread tiers
+    spread1 = eligible[0][1] - (eligible[1][1] if len(eligible) >= 2 else -1e9)
+    spread2 = (eligible[1][1] - eligible[2][1]) if len(eligible) >= 3 else -1e9
+    if ALLOW_TWO_WHEN_SPREAD and len(eligible) >= 2 and spread1 >= SPREAD_THRESHOLD1:
+        chosen.append(eligible[1][0])
+    if ALLOW_THREE_WHEN_SPREAD and len(eligible) >= 3 and spread2 >= SPREAD_THRESHOLD2:
+        chosen.append(eligible[2][0])
 
-    if sum(raw.values()) <= 0:
-        raw = {s: 1.0 for s in top}
+    # Dynamic cap and cash buffer from spread between top1 and top2
+    cap, cash_buf = dynamic_caps(spread1 if np.isfinite(spread1) else 0.0)
 
-    w = {s: v / sum(raw.values()) for s, v in raw.items()}
-    w = {s: min(max_w, max(0.0, wv)) for s, wv in w.items()}
-    ssum = sum(w.values())
-    w = {s: (wv / ssum) for s, wv in w.items()} if ssum > 0 else {s: 1.0/len(top) for s in top}
-    return pd.Series(w, dtype=float)
+    # Base raw weights favoring rank
+    if len(chosen) == 1:
+        target_w = {chosen[0]: min(cap, 1.0 - cash_buf)}
+    else:
+        raw = {chosen[0]: 1.0}
+        if len(chosen) >= 2:
+            raw[chosen[1]] = 0.85
+        if len(chosen) >= 3:
+            raw[chosen[2]] = 0.70
+        ssum = sum(raw.values())
+        raw = {k: v / ssum for k, v in raw.items()}
+        capped = {k: min(cap, v) for k, v in raw.items()}
+        ssum = sum(capped.values())
+        target_w = {k: (v / ssum) * (1.0 - cash_buf) for k, v in capped.items()} if ssum > 0 else {chosen[0]: 1.0 - cash_buf}
+
+    return target_w, cash_buf
 
 def run_backtest(data: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     # Universe pick
-    if UNIVERSE_MODE.upper() == "BASE":
-        syms = _dedupe(UNIVERSE_BASE)
-    else:
-        syms = _dedupe(UNIVERSE_BASE + UNIVERSE_EXT)
+    syms = _dedupe(UNIVERSE_BASE if UNIVERSE_MODE.upper() == "BASE" else (UNIVERSE_BASE + UNIVERSE_EXT))
     syms = [s for s in syms if s in data]
     if BASE_SYMBOL not in syms:
         syms = [BASE_SYMBOL] + syms
     data_u = {s: data[s] for s in syms}
 
     idx, close, openp = build_panel(data_u)
-
     mom = composite_momentum(close, LOOKBACKS, LOOKBACK_WEIGHTS, SKIP_RECENT_DAYS)
-    inv = inverse_volatility_matrix(close, VOL_LOOKBACK) if INV_VOL else None
-    ma200 = close.rolling(MA_WINDOW, min_periods=MA_WINDOW).mean() if MA_FILTER else None
 
     # Earliest date with enough history for largest lookback
     earliest = idx[0] + pd.Timedelta(days=max(LOOKBACKS) + SKIP_RECENT_DAYS + 10)
@@ -264,8 +279,7 @@ def run_backtest(data: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame, pd.DataFr
         val = cash
         for s, pos in positions.items():
             if s in close.columns:
-                px = float(close.loc[t, s])
-                val += pos.qty * px
+                val += pos.qty * float(close.loc[t, s])
         return val
 
     for i, dt in enumerate(idx):
@@ -274,29 +288,50 @@ def run_backtest(data: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame, pd.DataFr
         if dt in reb_days and i + 1 < len(idx):
             t_exec = idx[i + 1]
             port_val = portfolio_value(dt)
-            tgt_w = compute_weights(
-                dt, close, mom, inv, MAX_WEIGHT_PER_ASSET,
-                ABSOLUTE_MOMENTUM, MA_FILTER, ma200, N_POSITIONS
-            )
 
-            if tgt_w.empty:
-                # go to cash
-                for s, p in list(positions.items()):
-                    opx = float(openp.loc[t_exec, s]) if s in openp.columns else np.nan
-                    if np.isfinite(opx) and p.qty > 0:
-                        px = apply_trade_cost(opx, "sell")
-                        cash += p.qty * px
-                        trades.append({"date": t_exec, "symbol": s, "side": "SELL", "qty": p.qty, "price": px, "reason": "rebalance_clear"})
-                positions.clear()
+            target_w, cash_buf = compute_target_weights(dt, close, mom)
+
+            if not target_w:
+                if DEFENSIVE_OVERRIDE and DEFENSIVE_ASSET in close.columns:
+                    # Flush everything into defensive (respect cash buffer max)
+                    investable = port_val * (1.0 - CASH_BUFFER_MAX)
+                    opx = float(openp.loc[t_exec, DEFENSIVE_ASSET]) if DEFENSIVE_ASSET in openp.columns else np.nan
+                    if np.isfinite(opx):
+                        # Sell all current
+                        for s, p in list(positions.items()):
+                            opxs = float(openp.loc[t_exec, s]) if s in openp.columns else np.nan
+                            if np.isfinite(opxs) and p.qty > 0:
+                                px = apply_trade_cost(opxs, "sell")
+                                cash += p.qty * px
+                                trades.append({"date": t_exec, "symbol": s, "side": "SELL", "qty": p.qty, "price": px, "reason": "defensive_override"})
+                                positions.pop(s, None)
+                        qty = round_qty(investable / apply_trade_cost(opx, "buy"))
+                        if qty > 0:
+                            cost = qty * apply_trade_cost(opx, "buy")
+                            if cost <= cash:
+                                cash -= cost
+                                positions[DEFENSIVE_ASSET] = Position(symbol=DEFENSIVE_ASSET, qty=qty, entry_px=apply_trade_cost(opx, "buy"))
+                                trades.append({"date": t_exec, "symbol": DEFENSIVE_ASSET, "side": "BUY", "qty": qty, "price": positions[DEFENSIVE_ASSET].entry_px, "reason": "defensive_override"})
+                else:
+                    # Go full cash
+                    for s, p in list(positions.items()):
+                        opx = float(openp.loc[t_exec, s]) if s in openp.columns else np.nan
+                        if np.isfinite(opx) and p.qty > 0:
+                            px = apply_trade_cost(opx, "sell")
+                            cash += p.qty * px
+                            trades.append({"date": t_exec, "symbol": s, "side": "SELL", "qty": p.qty, "price": px, "reason": "rebalance_clear"})
+                    positions.clear()
             else:
-                target_notional = {s: float(tgt_w[s]) * port_val for s in tgt_w.index}
+                # Build target notionals (respect dynamic cash buffer)
+                target_notional = {s: float(w) * port_val for s, w in target_w.items()}
                 cur_notional = {s: (pos.qty * float(close.loc[dt, s])) for s, pos in positions.items()}
                 all_syms = sorted(set(cur_notional.keys()).union(target_notional.keys()))
 
                 # Sells first
                 for s in all_syms:
                     opx = float(openp.loc[t_exec, s]) if s in openp.columns else np.nan
-                    if not np.isfinite(opx): continue
+                    if not np.isfinite(opx):
+                        continue
                     tgt = target_notional.get(s, 0.0)
                     cur = cur_notional.get(s, 0.0)
                     diff = tgt - cur
@@ -313,7 +348,8 @@ def run_backtest(data: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame, pd.DataFr
                 # Buys
                 for s in all_syms:
                     opx = float(openp.loc[t_exec, s]) if s in openp.columns else np.nan
-                    if not np.isfinite(opx): continue
+                    if not np.isfinite(opx):
+                        continue
                     tgt = target_notional.get(s, 0.0)
                     cur = cur_notional.get(s, 0.0)
                     diff = tgt - cur
@@ -322,12 +358,13 @@ def run_backtest(data: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame, pd.DataFr
                         qty = round_qty(min(diff, cash) / px)
                         if qty > 0:
                             cost = qty * px
-                            cash -= cost
-                            if s in positions:
-                                positions[s].qty += qty
-                            else:
-                                positions[s] = Position(symbol=s, qty=qty, entry_px=px)
-                            trades.append({"date": t_exec, "symbol": s, "side": "BUY", "qty": qty, "price": px, "reason": "rebalance"})
+                            if cost <= cash:
+                                cash -= cost
+                                if s in positions:
+                                    positions[s].qty += qty
+                                else:
+                                    positions[s] = Position(symbol=s, qty=qty, entry_px=px)
+                                trades.append({"date": t_exec, "symbol": s, "side": "BUY", "qty": qty, "price": px, "reason": "rebalance"})
 
         # Exposures at close
         for s in exposures.columns:
@@ -350,8 +387,7 @@ def compute_benchmark_equity(
         mode: str,
         data: Dict[str, pd.DataFrame],
         idx: pd.DatetimeIndex,
-        close: Optional[pd.DataFrame] = None,
-        mom: Optional[pd.DataFrame] = None
+        close: Optional[pd.DataFrame] = None
 ) -> pd.Series:
     m = mode.upper().strip()
     if m in ("VOO","QQQ"):
@@ -370,25 +406,6 @@ def compute_benchmark_equity(
             raise ValueError("No fully aligned series for equal-weight benchmark")
         norm = close[valid] / close[valid].iloc[0]
         eq = START_CAPITAL * norm.mean(axis=1)
-        return eq.reindex(idx).ffill()
-
-    if m == "TOP5_STATIC":
-        if close is None:
-            raise ValueError("close panel required for TOP5_STATIC")
-        if mom is None:
-            raise ValueError("momentum panel required for TOP5_STATIC")
-        first_valid = mom.dropna(how="all").index.min()
-        if pd.isna(first_valid):
-            raise ValueError("Insufficient history for TOP5_STATIC")
-        mser = mom.loc[first_valid].dropna().sort_values(ascending=False)
-        top = list(mser.index[:max(1, N_POSITIONS)])
-        sub = close[top].dropna()
-        if len(sub) == 0:
-            raise ValueError("No valid series for TOP5_STATIC")
-        weights = np.repeat(1.0 / len(top), len(top))
-        base = sub.iloc[0]
-        rel = sub.divide(base)
-        eq = START_CAPITAL * (rel @ weights)
         return eq.reindex(idx).ffill()
 
     raise ValueError(f"Unknown BENCHMARK_MODE: {mode}")
@@ -421,17 +438,23 @@ def _config_dict() -> Dict[str, object]:
         "YF_PERIOD": YF_PERIOD,
         "START_CAPITAL": START_CAPITAL,
         "UNIVERSE_MODE": UNIVERSE_MODE,
-        "N_POSITIONS": N_POSITIONS,
         "LOOKBACKS": LOOKBACKS,
         "LOOKBACK_WEIGHTS": LOOKBACK_WEIGHTS,
         "SKIP_RECENT_DAYS": SKIP_RECENT_DAYS,
         "REBALANCE_FREQ": REBALANCE_FREQ,
-        "INV_VOL": INV_VOL,
-        "VOL_LOOKBACK": VOL_LOOKBACK,
-        "MAX_WEIGHT_PER_ASSET": MAX_WEIGHT_PER_ASSET,
-        "ABSOLUTE_MOMENTUM": ABSOLUTE_MOMENTUM,
-        "MA_FILTER": MA_FILTER,
-        "MA_WINDOW": MA_WINDOW,
+        "N_POSITIONS_BASE": N_POSITIONS_BASE,
+        "ALLOW_TWO_WHEN_SPREAD": ALLOW_TWO_WHEN_SPREAD,
+        "ALLOW_THREE_WHEN_SPREAD": ALLOW_THREE_WHEN_SPREAD,
+        "SPREAD_THRESHOLD1": SPREAD_THRESHOLD1,
+        "SPREAD_THRESHOLD2": SPREAD_THRESHOLD2,
+        "ABS_MOM_GATE_BASE": ABS_MOM_GATE_BASE,
+        "ABS_MOM_GATE_SCALE_VOL": ABS_MOM_GATE_SCALE_VOL,
+        "MAX_WEIGHT_MIN": MAX_WEIGHT_MIN,
+        "MAX_WEIGHT_MAX": MAX_WEIGHT_MAX,
+        "CASH_BUFFER_MIN": CASH_BUFFER_MIN,
+        "CASH_BUFFER_MAX": CASH_BUFFER_MAX,
+        "DEFENSIVE_OVERRIDE": DEFENSIVE_OVERRIDE,
+        "DEFENSIVE_ASSET": DEFENSIVE_ASSET,
         "SLIPPAGE_BPS": SLIPPAGE_BPS,
         "FEE_BPS": FEE_BPS,
         "MIN_DOLLAR_VOL_AVG_30D": MIN_DOLLAR_VOL_AVG_30D,
@@ -468,10 +491,9 @@ def main():
     # Build aligned panels for benchmark
     idx = equity_df.index
     close_panel = pd.DataFrame({s: df["close"] for s, df in data.items()}, index=idx).dropna(how="all")
-    mom_panel = composite_momentum(close_panel, LOOKBACKS, LOOKBACK_WEIGHTS, SKIP_RECENT_DAYS)
 
     # Benchmark
-    bench_series = compute_benchmark_equity(BENCHMARK_MODE, data, idx, close_panel, mom_panel)
+    bench_series = compute_benchmark_equity(BENCHMARK_MODE, data, idx, close_panel)
     equity_df["benchmark"] = bench_series
     bench_stats = compute_stats(equity_df["benchmark"])
 

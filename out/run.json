@@ -27,17 +27,21 @@
       "ICLN",
       "TAN",
       "PBW",
-      "ARKK"
+      "ARKK",
+      "IEF",
+      "TLT",
+      "GLD",
+      "IAU",
+      "SHY"
     ],
     "BASE_SYMBOL": "VOO",
     "YF_PERIOD": "max",
-    "START_CAPITAL": 100000.0,
+    "START_CAPITAL": 1000.0,
     "UNIVERSE_MODE": "EXT",
-    "N_POSITIONS": 1,
     "LOOKBACKS": [
-      252,
-      126,
-      21
+      42,
+      14,
+      7
     ],
     "LOOKBACK_WEIGHTS": [
       0.4,
@@ -45,13 +49,20 @@
       0.2
     ],
     "SKIP_RECENT_DAYS": 0,
-    "REBALANCE_FREQ": "2W",
-    "INV_VOL": false,
-    "VOL_LOOKBACK": 20,
-    "MAX_WEIGHT_PER_ASSET": 0.6,
-    "ABSOLUTE_MOMENTUM": true,
-    "MA_FILTER": false,
-    "MA_WINDOW": 200,
+    "REBALANCE_FREQ": "D",
+    "N_POSITIONS_BASE": 1,
+    "ALLOW_TWO_WHEN_SPREAD": true,
+    "ALLOW_THREE_WHEN_SPREAD": true,
+    "SPREAD_THRESHOLD1": 0.01,
+    "SPREAD_THRESHOLD2": 0.0075,
+    "ABS_MOM_GATE_BASE": 0.003,
+    "ABS_MOM_GATE_SCALE_VOL": false,
+    "MAX_WEIGHT_MIN": 0.8,
+    "MAX_WEIGHT_MAX": 1.0,
+    "CASH_BUFFER_MIN": 0.02,
+    "CASH_BUFFER_MAX": 0.1,
+    "DEFENSIVE_OVERRIDE": true,
+    "DEFENSIVE_ASSET": "IAU",
     "SLIPPAGE_BPS": 1,
     "FEE_BPS": 1,
     "MIN_DOLLAR_VOL_AVG_30D": 2000000,
@@ -59,22 +70,22 @@
     "QTY_DECIMALS": 4,
     "BENCHMARK_MODE": "VOO"
   },
-  "config_hash": "547a0a2566b7bb0d41186d5225f2cc1e5d1c279838722a1d44adc09a398109bf",
+  "config_hash": "6be2e672fed80ad74b164ac0dac189b7339f4d5ba8a6e6bf1d6b54ff58c1d73d",
   "stats_strategy": {
-    "CAGR": 0.2952228932098151,
-    "TotalReturn": 49.013331962950005,
-    "MaxDD": -0.4333278896948206,
-    "Vol": 0.3041129083727411,
-    "Sharpe": 1.0049331503526304,
-    "MAR": 0.6812921582724145
+    "CAGR": 0.314423573389194,
+    "TotalReturn": 61.4798449868261,
+    "MaxDD": -0.19331735769511948,
+    "Vol": 0.20468018087378878,
+    "Sharpe": 1.4410386539826727,
+    "MAR": 1.6264632267789991
   },
   "stats_benchmark": {
     "CAGR": 0.12754706819681783,
     "TotalReturn": 5.144393897237356,
-    "MaxDD": -0.34301429483265344,
-    "Vol": 0.17179928154082527,
-    "Sharpe": 0.7862099302247187,
-    "MAR": 0.37184184483927785
+    "MaxDD": -0.34301429483265333,
+    "Vol": 0.17179928154082535,
+    "Sharpe": 0.7862099302247189,
+    "MAR": 0.37184184483927796
   },
   "universe": [
     "VOO",
@@ -99,6 +110,11 @@
     "IBB",
     "XLC",
     "TAN",
-    "ARKK"
+    "ARKK",
+    "IEF",
+    "TLT",
+    "GLD",
+    "IAU",
+    "SHY"
   ]
 }
