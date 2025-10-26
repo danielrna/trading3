@@ -1,7 +1,7 @@
 # file: signals_daily_pipeline.py
-# Purpose: cron-friendly, auto-rolling daily signal generator (JSON/CSV) for AME_V3 strategy
+# Purpose: cron-friendly, auto-rolling daily signal generator (JSON/CSV) for AME_V3 strategy + automatic email notification
 # Python 3.10+
-# Deps: pandas, numpy, yfinance
+# Deps: pandas, numpy, yfinance, python-dotenv
 # Usage (cron):  15 22 * * 1-5 /opt/miniconda3/envs/trading3/bin/python /Users/danielrna/IdeaProjects/trading3/signals_daily_pipeline.py
 
 import argparse
@@ -11,11 +11,15 @@ import os
 import sys
 from typing import Dict, List, Tuple
 
-import numpy as np
 import pandas as pd
+# 🔹 Load environment variables from .env
+from dotenv import load_dotenv
+
+from utils.mail_sender import send_email
+
+load_dotenv()
 
 # ---- Strategy module import (uses your refactored AME_V3 engine) ----
-# Must be in PYTHONPATH or same directory.
 import etf_cross_sectional_momentum_v2 as strat
 
 
@@ -24,12 +28,15 @@ import etf_cross_sectional_momentum_v2 as strat
 def ensure_dir(p: str) -> None:
     os.makedirs(p, exist_ok=True)
 
+
 def today_ymd() -> str:
     return dt.datetime.now(dt.timezone.utc).astimezone().strftime("%Y-%m-%d")
+
 
 def write_json(fp: str, obj: dict) -> None:
     with open(fp, "w") as f:
         json.dump(obj, f, indent=2)
+
 
 def write_csv(fp: str, rows: List[Dict[str, object]], cols: List[str]) -> None:
     pd.DataFrame(rows, columns=cols).to_csv(fp, index=False)
@@ -44,6 +51,7 @@ def pick_universe() -> List[str]:
     )
     return syms
 
+
 def compute_momentum_panel(close: pd.DataFrame) -> pd.DataFrame:
     return strat.composite_momentum(
         close,
@@ -52,9 +60,10 @@ def compute_momentum_panel(close: pd.DataFrame) -> pd.DataFrame:
         strat.SKIP_RECENT_DAYS
     )
 
+
 def latest_trading_day(index: pd.DatetimeIndex) -> pd.Timestamp:
-    # Use the last index element as the reference day
     return pd.Timestamp(index[-1])
+
 
 def materialize_signal(
         idx: pd.DatetimeIndex,
@@ -62,18 +71,7 @@ def materialize_signal(
         openp: pd.DataFrame,
         mom: pd.DataFrame,
 ) -> Tuple[pd.Timestamp, Dict[str, float], float, bool, str]:
-    """
-    Returns:
-      - signal_date
-      - target_weights {symbol: weight}
-      - cash_buffer
-      - defensive_applied
-      - defensive_symbol_or_empty
-    """
-    # Daily scheduling → generate signal for last known market day
     sig_dt = latest_trading_day(idx)
-
-    # Compute target weights via engine's selection logic
     target_w, cash_buf = strat.compute_target_weights(sig_dt, close, mom)
 
     defensive_applied = False
@@ -83,15 +81,12 @@ def materialize_signal(
         if strat.DEFENSIVE_OVERRIDE and strat.DEFENSIVE_ASSET in close.columns:
             defensive_applied = True
             defensive_symbol = strat.DEFENSIVE_ASSET
-            # Allocate everything (minus CASH_BUFFER_MAX) to defensive
             target_w = {strat.DEFENSIVE_ASSET: float(1.0 - strat.CASH_BUFFER_MAX)}
             cash_buf = float(strat.CASH_BUFFER_MAX)
         else:
-            # No signal; stay in cash
             target_w = {}
             cash_buf = 1.0
 
-    # Normalize for safety (numerical drift)
     ssum = sum(max(0.0, v) for v in target_w.values())
     if ssum > 0:
         target_w = {k: float(max(0.0, v) / ssum) * (1.0 - cash_buf) for k, v in target_w.items()}
@@ -106,18 +101,13 @@ def run_pipeline(out_dir: str, force: bool) -> None:
     signals_dir = os.path.join(out_dir, "signals")
     ensure_dir(signals_dir)
 
-    # 1) Fetch fresh data (universe aligns to BASE_SYMBOL calendar)
     universe = pick_universe()
     data = strat.fetch_data(universe)
-
-    # 2) Build OHLC panels and momentum
     idx, close, openp = strat.build_panel(data)
     mom = compute_momentum_panel(close)
 
-    # 3) Compute today's signal
     sig_dt, target_w, cash_buf, def_applied, def_sym = materialize_signal(idx, close, openp, mom)
 
-    # 4) Compose payload
     cfg = strat._config_dict()
     payload = {
         "as_of": str(sig_dt.date()),
@@ -149,7 +139,6 @@ def run_pipeline(out_dir: str, force: bool) -> None:
         "benchmark_mode": cfg["BENCHMARK_MODE"],
     }
 
-    # 5) Idempotency: if same signal already written for the same date, skip unless --force
     signal_key = json.dumps(payload["signal"], sort_keys=True)
     sig_hash = str(hash(signal_key))
     stamp = payload["as_of"]
@@ -167,14 +156,11 @@ def run_pipeline(out_dir: str, force: bool) -> None:
             prev_hash = None
 
     if (prev_hash == sig_hash) and (not force) and os.path.exists(out_json):
-        # No-op
         return
 
-    # 6) Write JSON + CSV + meta
     write_json(out_json, payload)
-
-    rows = [{"symbol": sym, "weight": payload["signal"]["weights"].get(sym, 0.0)} for sym in payload["signal"]["weights"].keys()]
-    # Include explicit cash row for convenience
+    rows = [{"symbol": sym, "weight": payload["signal"]["weights"].get(sym, 0.0)} for sym in
+            payload["signal"]["weights"].keys()]
     rows.append({"symbol": "CASH", "weight": payload["signal"]["cash_buffer"]})
     out_csv = os.path.join(signals_dir, f"signal_{stamp}.csv")
     write_csv(out_csv, rows, cols=["symbol", "weight"])
@@ -189,7 +175,6 @@ def run_pipeline(out_dir: str, force: bool) -> None:
     }
     write_json(meta_fp, meta)
 
-    # 7) Convenience symlink/copy to latest
     latest_json = os.path.join(signals_dir, "latest.json")
     latest_csv = os.path.join(signals_dir, "latest.csv")
     try:
@@ -200,7 +185,6 @@ def run_pipeline(out_dir: str, force: bool) -> None:
     except Exception:
         pass
     try:
-        # On platforms without symlink perms, copy instead
         try:
             if os.path.exists(latest_json):
                 os.remove(latest_json)
@@ -215,6 +199,39 @@ def run_pipeline(out_dir: str, force: bool) -> None:
     except Exception:
         pass
 
+    try:
+        sender_email = os.getenv("SENDER_EMAIL")
+        sender_password = os.getenv("SENDER_PASSWORD")
+        recipients_env = os.getenv("EMAIL_RECIPIENTS")
+        if sender_email and sender_password and recipients_env:
+            recipients = [r.strip() for r in recipients_env.split(",") if r.strip()]
+            top_assets = list(payload["signal"]["weights"].items())[:5]
+            top_text = "\n".join([f"{a[0]}: {a[1]:.4f}" for a in top_assets])
+            body = (
+                f"Daily Signal Generated for {stamp}\n\n"
+                f"Cash buffer: {payload['signal']['cash_buffer']:.2f}\n"
+                f"Defensive applied: {payload['signal']['defensive_applied']}\n"
+                f"Defensive symbol: {payload['signal']['defensive_symbol'] or 'N/A'}\n\n"
+                f"Top weights:\n{top_text}\n\n"
+                f"Files attached:\n- {out_json}\n- {out_csv}"
+            )
+            subject = f"[AME_V3] Daily Signal – {stamp}"
+            send_email(
+                subject=subject,
+                body=body,
+                recipients=recipients,
+                sender_email=sender_email,
+                sender_password=sender_password,
+                attachments=[out_json, out_csv],
+                smtp_server="smtp.gmail.com",
+                smtp_port=587,
+                html=False,
+            )
+        else:
+            print("Email skipped: missing .env configuration.")
+    except Exception as e:
+        print(f"Email sending failed: {e}")
+
 
 # --------------------------------- CLI ----------------------------------- #
 
@@ -224,9 +241,11 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     p.add_argument("--force", action="store_true", help="Force write even if signal unchanged for today's date")
     return p.parse_args(argv)
 
+
 def main() -> None:
     args = parse_args(sys.argv[1:])
     run_pipeline(out_dir=args.out_dir, force=args.force)
+
 
 if __name__ == "__main__":
     main()
