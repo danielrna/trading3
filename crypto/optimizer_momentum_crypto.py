@@ -1,5 +1,8 @@
-# AME-V3-HV-CRYPTO Optimizer
-# Spot-only, no leverage/derivatives. Built to maximize CAGR with pragmatic DD tolerance.
+# AME-V4.6-ULTRA-CRYPTO Optimizer (CAGR-focused with Drawdown-Duration Control)
+# Objective: MAX CAGR with constraint: avoid prolonged drawdowns.
+# - Hard fitness penalty if drawdown duration > 30 days (any time under high-water mark).
+# - Additional penalty if last-5Y CAGR < 200% (>= 2.0).
+# - Ultra-aggressive momentum; daily rebal; cash fallback when momentum collapses.
 # Python 3.10+
 # Deps: pandas, numpy, yfinance, matplotlib (optional)
 
@@ -23,64 +26,45 @@ YF_PERIOD = "max"
 START_CAPITAL = 100_000.0
 OUT_DIR = "./out"
 
-# Liquid spot crypto universe (USD pairs, no leverage)
 UNIVERSE = [
-    # majors
     "BTC-USD", "ETH-USD", "BNB-USD", "SOL-USD", "XRP-USD", "ADA-USD",
     "DOGE-USD", "TRX-USD", "AVAX-USD", "MATIC-USD", "DOT-USD",
     "LTC-USD", "BCH-USD", "LINK-USD", "ATOM-USD", "UNI-USD",
     "XLM-USD", "ETC-USD",
-    # defensives / cash proxies
     "USDT-USD", "USDC-USD",
 ]
 
-# Trading costs (spot, conservative)
 SLIPPAGE_BPS = 10
 FEE_BPS = 10
 QTY_DECIMALS = 8
 
-# Liquidity guards (soft)
 MIN_DOLLAR_VOL_AVG_30D = 2_000_000
 MIN_DAILY_DOLLAR_VOL = 500_000
+
+# Constraint targets
+MAX_DD_DURATION_DAYS = 30
+REQUIRED_CAGR_5Y = 2.0  # 200% annualized over last 5 years
 
 # --------------------------- Utilities ----------------------------------- #
 
 def _dedupe(seq: List[str]) -> List[str]:
     return list(dict.fromkeys(seq))
 
-
 def fetch_data(symbols: List[str], period: str = YF_PERIOD) -> Dict[str, pd.DataFrame]:
     symbols = _dedupe(symbols)
     raw = yf.download(
-        symbols,
-        period=period,
-        interval="1d",
-        group_by="ticker",
-        auto_adjust=False,
-        threads=True,
-        progress=False,
+        symbols, period=period, interval="1d",
+        group_by="ticker", auto_adjust=False, threads=True, progress=False
     )
     data: Dict[str, pd.DataFrame] = {}
 
     def clean(df: pd.DataFrame) -> pd.DataFrame:
-        d = df.rename(
-            columns={
-                "Open": "open",
-                "High": "high",
-                "Low": "low",
-                "Close": "close",
-                "Adj Close": "adj_close",
-                "Volume": "volume",
-            }
-        ).copy()
+        d = df.rename(columns={
+            "Open": "open", "High": "high", "Low": "low", "Close": "close",
+            "Adj Close": "adj_close", "Volume": "volume"
+        }).copy()
         d = d.dropna(subset=["open", "high", "low", "close", "volume"])
-        bad = (
-                (d["open"] <= 0)
-                | (d["high"] <= 0)
-                | (d["low"] <= 0)
-                | (d["close"] <= 0)
-                | (d["volume"] < 0)
-        )
+        bad = (d["open"] <= 0) | (d["high"] <= 0) | (d["low"] <= 0) | (d["close"] <= 0) | (d["volume"] < 0)
         d = d[~bad]
         d.index.name = "date"
         return d[["open", "high", "low", "close", "volume"]]
@@ -88,12 +72,10 @@ def fetch_data(symbols: List[str], period: str = YF_PERIOD) -> Dict[str, pd.Data
     if isinstance(raw.columns, pd.MultiIndex):
         top = raw.columns.get_level_values(0)
         for s in symbols:
-            if s not in top:
-                continue
-            data[s] = clean(raw[s].copy())
+            if s in top:
+                data[s] = clean(raw[s].copy())
     else:
-        s = symbols[0]
-        data[s] = clean(raw)
+        data[symbols[0]] = clean(raw)
 
     if BASE_SYMBOL not in data:
         raise ValueError(f"Missing {BASE_SYMBOL} from Yahoo")
@@ -101,7 +83,7 @@ def fetch_data(symbols: List[str], period: str = YF_PERIOD) -> Dict[str, pd.Data
     for s in list(data.keys()):
         data[s] = data[s].reindex(base_idx).dropna()
 
-    # soft liquidity screen
+    # Soft liquidity screen
     def liq_ok(df: pd.DataFrame) -> pd.Series:
         adv = (df["close"] * df["volume"]).rolling(30, min_periods=30).mean()
         daily = df["close"] * df["volume"]
@@ -116,31 +98,25 @@ def fetch_data(symbols: List[str], period: str = YF_PERIOD) -> Dict[str, pd.Data
         keep[BASE_SYMBOL] = data[BASE_SYMBOL]
     return keep
 
-
 def pct_change_series(s: pd.Series, periods: int) -> pd.Series:
     return s.pct_change(periods=periods, fill_method=None)
-
 
 def trailing_return(close: pd.Series, lookback: int, skip: int) -> pd.Series:
     past = close.shift(skip)
     ref = past.shift(lookback)
     return past.divide(ref) - 1.0
 
-
 def apply_cost(price: float, side: str) -> float:
     slip = price * (SLIPPAGE_BPS / 10_000)
     fee = price * (FEE_BPS / 10_000)
     return price + slip + fee if side == "buy" else price - slip - fee
 
-
 def round_qty(q: float) -> float:
-    if not np.isfinite(q) or q <= 0:
-        return 0.0
-    return float(np.floor(q * (10**QTY_DECIMALS)) / (10**QTY_DECIMALS))
-
+    if not np.isfinite(q) or q <= 0: return 0.0
+    return float(np.floor(q * (10 ** QTY_DECIMALS)) / (10 ** QTY_DECIMALS))
 
 def last_day_per_period(idx: pd.DatetimeIndex, freq: str) -> pd.DatetimeIndex:
-    f = freq.upper()
+    f = (freq or "D").upper()
     s = idx.to_series()
     if f == "M":
         g = s.groupby(idx.to_period("M")).max()
@@ -159,27 +135,19 @@ def last_day_per_period(idx: pd.DatetimeIndex, freq: str) -> pd.DatetimeIndex:
 
 @dataclass(frozen=True)
 class Params:
-    # core momentum
-    lookbacks: Tuple[int, int, int]  # e.g. (21,10,5)
+    lookbacks: Tuple[int, int, int]
     weights: Tuple[float, float, float]
-    skip_recent: int  # 0/1/2
-    rebalance: str  # 'D' or 'W'
-    n_positions_base: int  # 1 (kept for logging)
-    allow_two_when_spread: bool
+    skip_recent: int
+    rebalance: str
     allow_three_when_spread: bool
     spread_threshold1: float
     spread_threshold2: float
-
-    # gating & sizing
     abs_mom_gate_base: float
     max_weight_min: float
-    max_weight_max: float
+    max_weight_max: float  # leave wide; user doesn't care
     cash_buffer_min: float
     cash_buffer_max: float
-
-    # universe mode placeholder
-    universe_mode: str  # 'EXT'
-
+    universe_mode: str
 
 @dataclass
 class Result:
@@ -187,13 +155,11 @@ class Result:
     stats: Dict[str, float]
     bench: Dict[str, float]
 
-
 def build_panel(data: Dict[str, pd.DataFrame]) -> Tuple[pd.DatetimeIndex, pd.DataFrame, pd.DataFrame]:
     idx = data[BASE_SYMBOL].index
     close = pd.DataFrame({s: df["close"] for s, df in data.items()}, index=idx).dropna(how="all")
     openp = pd.DataFrame({s: df["open"] for s, df in data.items()}, index=idx).reindex(close.index)
     return close.index, close, openp
-
 
 def momentum_score(close: pd.DataFrame, p: Params) -> pd.DataFrame:
     l1, l2, l3 = p.lookbacks
@@ -203,25 +169,45 @@ def momentum_score(close: pd.DataFrame, p: Params) -> pd.DataFrame:
     m3 = trailing_return(close, l3, p.skip_recent)
     return w1 * m1 + w2 * m2 + w3 * m3
 
+# ------------------------ Cash-Fallback Rules ---------------------------- #
 
-def dynamic_max_weight(p: Params, spread: float) -> float:
-    spread = max(0.0, min(0.20, spread))
-    frac = spread / 0.20
-    return p.max_weight_min + (p.max_weight_max - p.max_weight_min) * frac
+def market_guard(dt: pd.Timestamp, close: pd.DataFrame, mom_row: pd.Series) -> bool:
+    """
+    Aggressive circuit breaker to avoid prolonged drawdowns:
+    - If the best momentum is <= abs_gate*0.5 (≈ non-existent) AND
+    - BTC 14d return < 0 AND cross-sectional median 14d return < 0
+    => Go to cash this rebalance.
+    """
+    # 14d returns
+    try:
+        btc = close["BTC-USD"]
+    except Exception:
+        return False
+    # guard when recent returns are decisively negative
+    if dt not in btc.index: return False
+    idx_pos = close.index.get_loc(dt)
+    if idx_pos < 14: return False
+    r14_btc = float(btc.iloc[idx_pos] / btc.iloc[idx_pos - 14] - 1.0)
+    # breadth via median of top universe 14d ret
+    r14_all = close.iloc[idx_pos] / close.iloc[idx_pos - 14] - 1.0
+    med14 = float(np.nanmedian(r14_all.values))
 
+    # best raw momentum signal
+    top_mom = float(np.nanmax(mom_row.values))
 
-def dynamic_cash_buffer(p: Params, spread: float) -> float:
-    spread = max(0.0, min(0.20, spread))
-    frac = spread / 0.20
-    return p.cash_buffer_max - (p.cash_buffer_max - p.cash_buffer_min) * frac
+    # thresholds
+    weak_mom = (top_mom <= 0.0)  # super strict: require positive momentum to be long
+    bad_tape = (r14_btc < 0.0) and (med14 < 0.0)
 
+    return bool(weak_mom and bad_tape)
+
+# ------------------------------ Backtest --------------------------------- #
 
 def run_strategy(data: Dict[str, pd.DataFrame], p: Params) -> Tuple[pd.DataFrame, pd.DataFrame]:
     idx, close, openp = build_panel(data)
     mom = momentum_score(close, p)
 
-    # Rebalance cadence
-    reb_days = last_day_per_period(idx, p.rebalance or 'D')
+    reb_days = last_day_per_period(idx, 'D')
 
     largest_lb = max(p.lookbacks) + p.skip_recent + 10
     first_allowed = idx[0] + pd.Timedelta(days=largest_lb)
@@ -235,14 +221,12 @@ def run_strategy(data: Dict[str, pd.DataFrame], p: Params) -> Tuple[pd.DataFrame
 
     def pv(dt: pd.Timestamp) -> float:
         v = cash
-        # fast vector valuation
         if positions:
             syms = list(positions.keys())
             px = close.loc[dt, syms]
             v += float(np.nansum(px.values * np.array([positions[s] for s in syms], dtype=float)))
         return v
 
-    # Precompute eligible mask per day for speed
     mom_np = mom.to_numpy(copy=False)
     cols = list(mom.columns)
     col_is_def = np.array([c in defensive_set for c in cols], dtype=bool)
@@ -255,33 +239,11 @@ def run_strategy(data: Dict[str, pd.DataFrame], p: Params) -> Tuple[pd.DataFrame
         t_exec = idx[i + 1]
         port_val = pv(dt)
 
-        # Eligible set: apply absolute momentum gate; exclude defensives
+        # Momentum row and guard
         row = mom_np[i, :]
-        valid = np.isfinite(row) & (~col_is_def)
-
-        if valid.any():
-            gated = valid & (row > p.abs_mom_gate_base)
-        else:
-            gated = valid
-
-        # If nothing passes the gate, still force top-1 by raw momentum (hyper-growth mode)
-        picks_syms: List[str] = []
-        spread = 0.0
-
-        if gated.any():
-            # rank by momentum score
-            order = np.argsort(row[gated])[::-1]
-            elig_syms = [cols[j] for j in np.where(gated)[0][order]]
-        else:
-            # fallback to best raw momentum ignoring gate (can be negative)
-            if valid.any():
-                order_all = np.argsort(row[valid])[::-1]
-                elig_syms = [cols[j] for j in np.where(valid)[0][order_all]]
-            else:
-                elig_syms = []
-
-        if not elig_syms:
-            # liquidate to cash (rare if valid empty)
+        row_series = pd.Series(row, index=cols)
+        if market_guard(dt, close, row_series):
+            # Full cash this rebalance to cut drawdown duration
             if positions:
                 for s, qty in list(positions.items()):
                     opx = float(openp.loc[t_exec, s]) if s in openp.columns else np.nan
@@ -291,56 +253,74 @@ def run_strategy(data: Dict[str, pd.DataFrame], p: Params) -> Tuple[pd.DataFrame
                 positions.clear()
             continue
 
-        # Build picks with spread checks over momentum differences
-        picks_syms.append(elig_syms[0])
-        # Need momentum values for top ranks
-        top_vals = []
-        for k in range(min(3, len(elig_syms))):
-            s = elig_syms[k]
-            j = cols.index(s)
-            top_vals.append(float(row[j]) if np.isfinite(row[j]) else -np.inf)
+        valid = np.isfinite(row) & (~col_is_def)
+        gated = valid & (row > p.abs_mom_gate_base)
 
-        if p.allow_two_when_spread and len(elig_syms) >= 2:
+        if gated.any():
+            order = np.argsort(row[gated])[::-1]
+            elig_idx = np.where(gated)[0][order]
+        elif valid.any():
+            order_all = np.argsort(row[valid])[::-1]
+            elig_idx = np.where(valid)[0][order_all]
+        else:
+            # liquidate to cash
+            if positions:
+                for s, qty in list(positions.items()):
+                    opx = float(openp.loc[t_exec, s]) if s in openp.columns else np.nan
+                    if np.isfinite(opx) and qty > 0:
+                        exec_px = apply_cost(opx, "sell")
+                        cash += qty * exec_px
+                positions.clear()
+            continue
+
+        elig_syms = [cols[j] for j in elig_idx]
+        top_vals = [float(row[j]) if np.isfinite(row[j]) else -np.inf for j in elig_idx[:3]]
+
+        picks: List[str] = [elig_syms[0]]
+        spread = 0.0
+
+        if len(elig_syms) >= 2:
             if (top_vals[0] - top_vals[1]) >= p.spread_threshold1:
-                picks_syms.append(elig_syms[1])
+                picks.append(elig_syms[1])
                 spread = max(spread, top_vals[0] - top_vals[1])
 
         if p.allow_three_when_spread and len(elig_syms) >= 3:
             if (top_vals[1] - top_vals[2]) >= p.spread_threshold2:
-                picks_syms.append(elig_syms[2])
+                picks.append(elig_syms[2])
                 spread = max(spread, top_vals[1] - top_vals[2])
 
         # dynamic sizing
-        max_w = dynamic_max_weight(p, spread)
-        cash_buf = dynamic_cash_buffer(p, spread)
+        spread_clip = max(0.0, min(0.20, spread))
+        frac = spread_clip / 0.20
+        max_w = p.max_weight_min + (p.max_weight_max - p.max_weight_min) * frac
+        cash_buf = p.cash_buffer_max - (p.cash_buffer_max - p.cash_buffer_min) * frac
 
-        if len(picks_syms) == 1:
-            target_w = {picks_syms[0]: min(max_w, 1.0 - cash_buf)}
-        elif len(picks_syms) == 2:
-            raw = {picks_syms[0]: 1.0, picks_syms[1]: 0.85}
+        if len(picks) == 1:
+            target_w = {picks[0]: min(max_w, 1.0 - cash_buf)}
+        elif len(picks) == 2:
+            raw = {picks[0]: 1.0, picks[1]: 0.9}
             ssum = sum(raw.values())
             raw = {k: v / ssum for k, v in raw.items()}
             capped = {k: min(max_w, v) for k, v in raw.items()}
             ssum = sum(capped.values())
             target_w = {k: (v / ssum) * (1.0 - cash_buf) for k, v in capped.items()} if ssum > 0 else {
-                picks_syms[0]: 1.0 - cash_buf
+                picks[0]: 1.0 - cash_buf
             }
         else:
-            raw = {picks_syms[0]: 1.0, picks_syms[1]: 0.85, picks_syms[2]: 0.70}
+            raw = {picks[0]: 1.0, picks[1]: 0.9, picks[2]: 0.8}
             ssum = sum(raw.values())
             raw = {k: v / ssum for k, v in raw.items()}
             capped = {k: min(max_w, v) for k, v in raw.items()}
             ssum = sum(capped.values())
             target_w = {k: (v / ssum) * (1.0 - cash_buf) for k, v in capped.items()} if ssum > 0 else {
-                picks_syms[0]: 1.0 - cash_buf
+                picks[0]: 1.0 - cash_buf
             }
 
-        # translate to notionals
         target_notional = {s: w * port_val for s, w in target_w.items()}
         cur_notional = {s: positions.get(s, 0.0) * float(close.loc[dt, s]) for s in positions.keys()}
         all_syms = sorted(set(list(cur_notional.keys()) + list(target_notional.keys())))
 
-        # Sells first
+        # Sells
         for s in all_syms:
             opx = float(openp.loc[t_exec, s]) if s in openp.columns else np.nan
             if not np.isfinite(opx):
@@ -354,14 +334,12 @@ def run_strategy(data: Dict[str, pd.DataFrame], p: Params) -> Tuple[pd.DataFrame
                     exec_px = apply_cost(opx, "sell")
                     cash += qty * exec_px
                     positions[s] = positions.get(s, 0.0) - qty
-                    if positions[s] <= 0:
-                        positions.pop(s, None)
+                    if positions[s] <= 0: positions.pop(s, None)
 
         # Buys
         for s in all_syms:
             opx = float(openp.loc[t_exec, s]) if s in openp.columns else np.nan
-            if not np.isfinite(opx):
-                continue
+            if not np.isfinite(opx): continue
             tgt = target_notional.get(s, 0.0)
             cur = cur_notional.get(s, 0.0)
             diff = tgt - cur
@@ -378,7 +356,7 @@ def run_strategy(data: Dict[str, pd.DataFrame], p: Params) -> Tuple[pd.DataFrame
         equity.iloc[-1] = pv(idx[-1])
     equity_df = equity.to_frame("equity")
 
-    # Benchmark: BTC buy&hold
+    # Benchmark: BTC buy & hold
     base_close = data[BASE_SYMBOL]["close"].reindex(idx).dropna()
     bench_equity = (START_CAPITAL * (base_close / base_close.iloc[0])).reindex(idx).ffill()
     equity_df["benchmark"] = bench_equity
@@ -389,7 +367,8 @@ def run_strategy(data: Dict[str, pd.DataFrame], p: Params) -> Tuple[pd.DataFrame
 def compute_stats(equity: pd.Series) -> Dict[str, float]:
     eq = equity.dropna()
     if len(eq) < 2:
-        return {k: np.nan for k in ["CAGR", "TotalReturn", "MaxDD", "Vol", "Sharpe", "MAR"]}
+        return {k: np.nan for k in ["CAGR", "TotalReturn", "MaxDD", "Vol", "Sharpe", "MAR",
+                                    "MaxDDDuration", "CAGR_5Y"]}
     rets = eq.pct_change().iloc[1:]
     total = float(eq.iloc[-1] / eq.iloc[0] - 1.0)
     days = (eq.index[-1] - eq.index[0]).days
@@ -399,26 +378,65 @@ def compute_stats(equity: pd.Series) -> Dict[str, float]:
     maxdd = float(dd.min()) if len(dd) else np.nan
     vol = float(rets.std() * np.sqrt(365)) if rets.std() > 0 else np.nan
     sharpe = float(rets.mean() / rets.std() * np.sqrt(365)) if rets.std() > 0 else np.nan
-    mar = float(cagr / abs(maxdd)) if (
-            isinstance(maxdd, float) and maxdd < 0 and cagr is not None and not np.isnan(cagr)
-    ) else np.nan
-    return {"CAGR": cagr, "TotalReturn": total, "MaxDD": maxdd, "Vol": vol, "Sharpe": sharpe, "MAR": mar}
+    mar = float(cagr / abs(maxdd)) if (isinstance(maxdd, float) and maxdd < 0 and not np.isnan(cagr)) else np.nan
 
+    # Drawdown duration (longest stretch under previous peak)
+    under = dd < 0
+    # compute longest run length
+    max_len = 0
+    cur_len = 0
+    for flag in under.astype(int).values:
+        if flag:
+            cur_len += 1
+            if cur_len > max_len:
+                max_len = cur_len
+        else:
+            cur_len = 0
+
+    # Last-5Y CAGR
+    end_date = eq.index[-1]
+    start_5y = end_date - pd.Timedelta(days=int(365.25 * 5))
+    eq5 = eq[eq.index >= start_5y]
+    if len(eq5) >= 2:
+        total5 = float(eq5.iloc[-1] / eq5.iloc[0] - 1.0)
+        yrs5 = (eq5.index[-1] - eq5.index[0]).days / 365.25
+        cagr5 = (1 + total5) ** (1 / yrs5) - 1 if yrs5 > 0 else np.nan
+    else:
+        cagr5 = np.nan
+
+    return {"CAGR": cagr, "TotalReturn": total, "MaxDD": maxdd, "Vol": vol,
+            "Sharpe": sharpe, "MAR": mar, "MaxDDDuration": float(max_len), "CAGR_5Y": cagr5}
 
 def fitness(res: Result) -> float:
     cagr = res.stats.get("CAGR", np.nan)
     dd = res.stats.get("MaxDD", np.nan)
     sharpe = res.stats.get("Sharpe", np.nan)
     bench_cagr = res.bench.get("CAGR", np.nan)
-    if any(np.isnan(x) for x in [cagr, dd, bench_cagr]):
+    dd_dur = res.stats.get("MaxDDDuration", np.nan)
+    cagr5 = res.stats.get("CAGR_5Y", np.nan)
+
+    if any(np.isnan(x) for x in [cagr, dd, bench_cagr, dd_dur, cagr5]):
         return -1e9
+
+    # Base edge on CAGR vs BTC
     edge = cagr - bench_cagr
+
+    # Penalties
     pen = 0.0
-    # Allow deeper drawdowns before penalizing (hyper-growth mode)
+
+    # Hard penalty for prolonged drawdown duration
+    if dd_dur > MAX_DD_DURATION_DAYS:
+        pen += (dd_dur - MAX_DD_DURATION_DAYS) * 15.0  # strong per-day penalty
+
+    # Soft penalty for very deep DD (still tolerate aggression)
     if dd < -0.85:
-        pen += (abs(dd) - 0.85) * 8.0
-    # Stronger weight on CAGR edge, some value to Sharpe
-    return edge * 220.0 + (sharpe if not np.isnan(sharpe) else 0.0) * 5.0 - pen
+        pen += (abs(dd) - 0.85) * 50.0
+
+    # Enforce last-5Y CAGR >= 200%
+    if cagr5 < REQUIRED_CAGR_5Y:
+        pen += (REQUIRED_CAGR_5Y - cagr5) * 500.0  # heavy shortfall penalty
+
+    return edge * 260.0 + (sharpe if not np.isnan(sharpe) else 0.0) * 2.0 - pen
 
 def evaluate(data: Dict[str, pd.DataFrame], p: Params) -> Result:
     eq, _ = run_strategy(data, p)
@@ -429,59 +447,52 @@ def evaluate(data: Dict[str, pd.DataFrame], p: Params) -> Result:
 # --------------------------- Search Space -------------------------------- #
 
 LB_OPTIONS = [
-    (14, 7, 3),
-    (21, 10, 5),
-    (28, 14, 7),
-    (42, 14, 7),
-    (63, 21, 7),
+    (63, 21, 7), (42, 14, 7), (28, 14, 7),
+    (21, 10, 5), (14, 7, 3),
+    (10, 5, 2), (7, 3, 1), (5, 2, 1), (3, 1, 0),
 ]
 WT_OPTIONS = [
+    (0.9, 0.08, 0.02),
+    (0.8, 0.15, 0.05),
     (0.7, 0.2, 0.1),
     (0.6, 0.3, 0.1),
     (0.5, 0.3, 0.2),
-    (0.4, 0.4, 0.2),
 ]
 SKIP_OPTIONS = [0, 1, 2]
-GATE_OPTIONS = [0.000, 0.005, 0.010]
-SPREAD_OPTIONS = [0.003, 0.005, 0.010]
-REBALANCE_OPTIONS = ['D', 'W']
+GATE_OPTIONS = [-0.02, 0.000, 0.005]  # slightly less negative than V4 to reduce whipsaw risk
+SPREAD_OPTIONS = [0.001, 0.003, 0.005]
 
 def random_params() -> Params:
     return Params(
         lookbacks=random.choice(LB_OPTIONS),
         weights=random.choice(WT_OPTIONS),
         skip_recent=random.choice(SKIP_OPTIONS),
-        rebalance=random.choice(REBALANCE_OPTIONS),
-        n_positions_base=1,
-        allow_two_when_spread=True,
-        allow_three_when_spread=random.choice([True, False]),
+        rebalance='D',
+        allow_three_when_spread=True,
         spread_threshold1=random.choice(SPREAD_OPTIONS),
         spread_threshold2=random.choice(SPREAD_OPTIONS),
         abs_mom_gate_base=random.choice(GATE_OPTIONS),
-        max_weight_min=0.90,
-        max_weight_max=1.50,
+        max_weight_min=1.00,
+        max_weight_max=2.50,  # user doesn't care; keep wide
         cash_buffer_min=0.00,
-        cash_buffer_max=0.05,
+        cash_buffer_max=0.05,  # allow small buffer to help duration
         universe_mode="EXT",
     )
 
-def mutate(p: Params, rate: float = 0.35) -> Params:
+def mutate(p: Params, rate: float = 0.55) -> Params:
     def flip(cur, opts):
         return random.choice([o for o in opts if o != cur]) if random.random() < rate else cur
-
     return Params(
         lookbacks=flip(p.lookbacks, LB_OPTIONS),
         weights=flip(p.weights, WT_OPTIONS),
         skip_recent=flip(p.skip_recent, SKIP_OPTIONS),
-        rebalance=flip(p.rebalance, REBALANCE_OPTIONS),
-        n_positions_base=1,
-        allow_two_when_spread=True,
-        allow_three_when_spread=flip(p.allow_three_when_spread, [True, False]),
+        rebalance='D',
+        allow_three_when_spread=True,
         spread_threshold1=flip(p.spread_threshold1, SPREAD_OPTIONS),
         spread_threshold2=flip(p.spread_threshold2, SPREAD_OPTIONS),
         abs_mom_gate_base=flip(p.abs_mom_gate_base, GATE_OPTIONS),
-        max_weight_min=0.90,
-        max_weight_max=1.50,
+        max_weight_min=1.00,
+        max_weight_max=2.50,
         cash_buffer_min=0.00,
         cash_buffer_max=0.05,
         universe_mode=p.universe_mode,
@@ -493,15 +504,13 @@ def crossover(a: Params, b: Params) -> Params:
         lookbacks=pick(a.lookbacks, b.lookbacks),
         weights=pick(a.weights, b.weights),
         skip_recent=pick(a.skip_recent, b.skip_recent),
-        rebalance=pick(a.rebalance, b.rebalance),
-        n_positions_base=1,
-        allow_two_when_spread=True,
-        allow_three_when_spread=pick(a.allow_three_when_spread, b.allow_three_when_spread),
+        rebalance='D',
+        allow_three_when_spread=True,
         spread_threshold1=pick(a.spread_threshold1, b.spread_threshold1),
         spread_threshold2=pick(a.spread_threshold2, b.spread_threshold2),
         abs_mom_gate_base=pick(a.abs_mom_gate_base, b.abs_mom_gate_base),
-        max_weight_min=0.90,
-        max_weight_max=1.50,
+        max_weight_min=1.00,
+        max_weight_max=2.50,
         cash_buffer_min=0.00,
         cash_buffer_max=0.05,
         universe_mode=a.universe_mode,
@@ -511,10 +520,10 @@ def crossover(a: Params, b: Params) -> Params:
 
 def evolutionary_search(
         data: Dict[str, pd.DataFrame],
-        population_size: int = 64,
-        generations: int = 100,
-        elite_frac: float = 0.25,
-        mutation_rate: float = 0.35,
+        population_size: int = 120,
+        generations: int = 220,
+        elite_frac: float = 0.10,
+        mutation_rate: float = 0.55,
         seed: Optional[int] = 42,
 ) -> Tuple[List[Result], Result]:
     if seed is not None:
@@ -527,23 +536,29 @@ def evolutionary_search(
         gen_results = [evaluate(data, p) for p in pop]
         gen_results.sort(key=lambda r: fitness(r), reverse=True)
         best = gen_results[0]
+
+        def fmt_pct(x: float) -> str:
+            return f"{x * 100:.2f}%" if np.isfinite(x) else "nan"
+
         print(
             f"[Gen {gen + 1}/{generations}] "
             f"Score={fitness(best):.2f} | "
-            f"CAGR={best.stats['CAGR']:.2%} vs BTC {best.bench['CAGR']:.2%} | "
-            f"DD={best.stats['MaxDD']:.2%} | N={best.params.n_positions_base} "
-            f"| LBs={best.params.lookbacks} | Wts={best.params.weights} "
-            f"| AbsGate>{best.params.abs_mom_gate_base:.2%} | Reb={best.params.rebalance} "
-            f"| MaxW=[{best.params.max_weight_min:.2f},{best.params.max_weight_max:.2f}] "
-            f"| Spread>{best.params.spread_threshold1:.2%}/{best.params.spread_threshold2:.2%}"
+            f"CAGR={fmt_pct(best.stats['CAGR'])} vs BTC {fmt_pct(best.bench['CAGR'])} | "
+            f"DD={fmt_pct(best.stats['MaxDD'])} | "
+            f"DD_Dur={best.stats['MaxDDDuration']:.0f}d | "
+            f"CAGR_5Y={fmt_pct(best.stats['CAGR_5Y'])} | "
+            f"LBs={best.params.lookbacks} | Wts={best.params.weights} | "
+            f"AbsGate>{best.params.abs_mom_gate_base * 100:.2f}% | Reb={best.params.rebalance} | "
+            f"MaxW=[{best.params.max_weight_min:.2f},{best.params.max_weight_max:.2f}] | "
+            f"Spread>{best.params.spread_threshold1 * 100:.2f}%/{best.params.spread_threshold2 * 100:.2f}%"
         )
         results.extend(gen_results)
 
         n_elite = max(1, int(elite_frac * population_size))
         elite_params = [r.params for r in gen_results[:n_elite]]
+        parent_pool = [r.params for r in gen_results[: max(n_elite * 4, n_elite + 8)]]
 
         children: List[Params] = []
-        parent_pool = [r.params for r in gen_results[: max(n_elite * 3, n_elite + 5)]]
         while len(children) < population_size - n_elite:
             pa = random.choice(elite_params)
             pb = random.choice(parent_pool)
@@ -570,12 +585,12 @@ def save_results(all_results: List[Result], best: Result, tag: str) -> None:
             "Sharpe": r.stats.get("Sharpe"),
             "MAR": r.stats.get("MAR"),
             "Bench_CAGR": r.bench.get("CAGR"),
+            "MaxDDDuration": r.stats.get("MaxDDDuration"),
+            "CAGR_5Y": r.stats.get("CAGR_5Y"),
             "lookbacks": r.params.lookbacks,
             "weights": r.params.weights,
             "skip_recent": r.params.skip_recent,
             "rebalance": r.params.rebalance,
-            "n_positions_base": r.params.n_positions_base,
-            "allow_two_when_spread": r.params.allow_two_when_spread,
             "allow_three_when_spread": r.params.allow_three_when_spread,
             "spread_threshold1": r.params.spread_threshold1,
             "spread_threshold2": r.params.spread_threshold2,
@@ -586,8 +601,8 @@ def save_results(all_results: List[Result], best: Result, tag: str) -> None:
             "cash_buffer_max": r.params.cash_buffer_max,
             "universe_mode": r.params.universe_mode,
         })
-    df = pd.DataFrame(rows).sort_values("score", ascending=False).head(300)
-    df.to_csv(f"{OUT_DIR}/optimizer_results_ame_v3_hv_crypto.csv", index=False)
+    df = pd.DataFrame(rows).sort_values("score", ascending=False).head(400)
+    df.to_csv(f"{OUT_DIR}/optimizer_results_ame_v4p6_ultra_crypto.csv", index=False)
 
     manifest = {
         "best_params": {
@@ -595,8 +610,6 @@ def save_results(all_results: List[Result], best: Result, tag: str) -> None:
             "weights": best.params.weights,
             "skip_recent": best.params.skip_recent,
             "rebalance": best.params.rebalance,
-            "n_positions_base": best.params.n_positions_base,
-            "allow_two_when_spread": best.params.allow_two_when_spread,
             "allow_three_when_spread": best.params.allow_three_when_spread,
             "spread_threshold1": best.params.spread_threshold1,
             "spread_threshold2": best.params.spread_threshold2,
@@ -609,8 +622,12 @@ def save_results(all_results: List[Result], best: Result, tag: str) -> None:
         },
         "best_stats": best.stats,
         "best_benchmark": best.bench,
+        "constraints": {
+            "MaxDDDurationDays": MAX_DD_DURATION_DAYS,
+            "RequiredCAGR5Y": REQUIRED_CAGR_5Y,
+        }
     }
-    with open(f"{OUT_DIR}/optimizer_manifest_ame_v3_hv_crypto.json", "w") as f:
+    with open(f"{OUT_DIR}/optimizer_manifest_ame_v4p6_ultra_crypto.json", "w") as f:
         json.dump(manifest, f, indent=2)
 
 # -------------------------------- Main ----------------------------------- #
@@ -623,29 +640,23 @@ def main():
 
     all_results, best = evolutionary_search(
         data,
-        population_size=64,
-        generations=100,
-        elite_frac=0.25,
-        mutation_rate=0.35,
+        population_size=120,
+        generations=220,
+        elite_frac=0.10,
+        mutation_rate=0.55,
         seed=42,
     )
 
-    save_results(all_results, best, tag="v3_hv_crypto")
+    save_results(all_results, best, tag="v4p6_ultra_crypto")
 
     print("\nBest Configuration:")
     print(best.params)
     print("Strategy Stats:")
     for k, v in best.stats.items():
-        if isinstance(v, float) and not np.isnan(v):
-            print(f"{k}: {v:.4%}")
-        else:
-            print(f"{k}: {v}")
+        print(f"{k}: {v:.4%}" if isinstance(v, float) and np.isfinite(v) else f"{k}: {v}")
     print("Benchmark (BTC-USD) Stats:")
     for k, v in best.bench.items():
-        if isinstance(v, float) and not np.isnan(v):
-            print(f"{k}: {v:.4%}")
-        else:
-            print(f"{k}: {v}")
+        print(f"{k}: {v:.4%}" if isinstance(v, float) and np.isfinite(v) else f"{k}: {v}")
     print(f"Score: {fitness(best):.2f}")
 
     try:
@@ -653,11 +664,11 @@ def main():
         import matplotlib.pyplot as plt
         plt.figure()
         eq[["equity", "benchmark"]].plot()
-        plt.title("AME-V3-HV-CRYPTO Best Strategy vs BTC-USD")
+        plt.title("AME-V4.6-ULTRA-CRYPTO Best Strategy vs BTC-USD")
         plt.xlabel("Date")
         plt.ylabel("Equity")
         plt.tight_layout()
-        fp = f"{OUT_DIR}/optimizer_ame_v3_hv_crypto_best_equity.png"
+        fp = f"{OUT_DIR}/optimizer_ame_v4p6_ultra_crypto_best_equity.png"
         plt.savefig(fp)
         plt.close()
         print(f"Saved: {fp}")
