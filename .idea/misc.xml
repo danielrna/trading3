@@ -4,6 +4,6 @@
     <option name="sdkName" value="Python 3.11 (trading3)" />
   </component>
   <component name="ProjectRootManager">
-    <output url="file://$PROJECT_DIR$/out" />
+    <output url="file://$PROJECT_DIR$/stocks/out" />
   </component>
 </project>
