@@ -402,6 +402,7 @@ def fitness(res: Result) -> float:
     dd_dur = res.stats.get("MaxDDDuration", np.nan)
     cagr5 = res.stats.get("CAGR_5Y", np.nan)
 
+
     if any(np.isnan(x) for x in [cagr, dd, bench_cagr, dd_dur, cagr5]):
         return -1e9
 
@@ -409,7 +410,7 @@ def fitness(res: Result) -> float:
 
     pen = 0.0
     if dd_dur > MAX_DD_DURATION_DAYS:
-        pen += (dd_dur - MAX_DD_DURATION_DAYS) * 15.0
+        return -1e9
     if dd < -0.85:
         pen += (abs(dd) - 0.85) * 50.0
     if cagr5 < REQUIRED_CAGR_5Y:
