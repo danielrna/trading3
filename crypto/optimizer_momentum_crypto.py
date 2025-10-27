@@ -1,15 +1,11 @@
-# AME-V4.6-ULTRA-CRYPTO Optimizer (CAGR-focused with Drawdown-Duration Control)
-# Objective: MAX CAGR with constraint: avoid prolonged drawdowns.
-# - Hard fitness penalty if drawdown duration > 30 days (any time under high-water mark).
-# - Additional penalty if last-5Y CAGR < 200% (>= 2.0).
-# - Ultra-aggressive momentum; daily rebal; cash fallback when momentum collapses.
-# Python 3.10+
-# Deps: pandas, numpy, yfinance, matplotlib (optional)
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-import json
-import os
-import random
-import warnings
+# NSGA-II Pareto Optimizer for Crypto Momentum
+# Objectives: maximize CAGR, minimize MaxDD
+# Single-file, no patches. Python 3.10+. Deps: numpy, pandas, yfinance, matplotlib (optional)
+
+import os, json, math, random, warnings
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 
@@ -19,196 +15,146 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-# ------------------------------- Data ------------------------------------ #
+# ------------------------------- Config ---------------------------------- #
 
 BASE_SYMBOL = "BTC-USD"
-YF_PERIOD = "max"
-START_CAPITAL = 100_000.0
-OUT_DIR = "./out"
-
 UNIVERSE = [
-    "BTC-USD", "ETH-USD", "BNB-USD", "SOL-USD", "XRP-USD", "ADA-USD",
-    "DOGE-USD", "TRX-USD", "AVAX-USD", "MATIC-USD", "DOT-USD",
-    "LTC-USD", "BCH-USD", "LINK-USD", "ATOM-USD", "UNI-USD",
-    "XLM-USD", "ETC-USD",
-    "USDT-USD", "USDC-USD",
+    "BTC-USD","ETH-USD","BNB-USD","SOL-USD","XRP-USD","ADA-USD",
+    "DOGE-USD","TRX-USD","AVAX-USD","MATIC-USD","DOT-USD",
+    "LTC-USD","BCH-USD","LINK-USD","ATOM-USD","UNI-USD",
+    "XLM-USD","ETC-USD","USDT-USD","USDC-USD",
 ]
+YF_PERIOD = "max"
+OUT_DIR = "./out"
+START_CAPITAL = 100_000.0
 
 SLIPPAGE_BPS = 10
 FEE_BPS = 10
 QTY_DECIMALS = 8
 
 MIN_DOLLAR_VOL_AVG_30D = 2_000_000
-MIN_DAILY_DOLLAR_VOL = 500_000
+MIN_DAILY_DOLLAR_VOL   =   500_000
 
-# Constraint targets
-MAX_DD_DURATION_DAYS = 30
-REQUIRED_CAGR_5Y = 2.0  # 200% annualized over last 5 years
+# NSGA-II / Search
+POP_SIZE          = 120
+GENERATIONS       = 120
+ELITE_FRACTION    = 0.1
+TOURNAMENT_K      = 3
+CXPB              = 0.9     # crossover prob
+MUTPB             = 0.5     # mutation prob
+EARLYSTOP_PATIENCE= 10
+HYPERVOL_EPS      = 1e-4
+LHS_INIT_FACTOR   = 6       # population = LHS_INIT_FACTOR * dim (then trimmed to POP_SIZE)
+KFOLDS            = 4       # time folds for walk-forward evaluation
+SEED              = 42
 
-# --------------------------- Utilities ----------------------------------- #
+random.seed(SEED); np.random.seed(SEED)
+
+# ------------------------------- Data ------------------------------------ #
 
 def _dedupe(seq: List[str]) -> List[str]:
     return list(dict.fromkeys(seq))
 
 def fetch_data(symbols: List[str], period: str = YF_PERIOD) -> Dict[str, pd.DataFrame]:
-    symbols = _dedupe(symbols)
-    raw = yf.download(
-        symbols, period=period, interval="1d",
-        group_by="ticker", auto_adjust=False, threads=True, progress=False
-    )
+    syms = _dedupe(symbols)
+    raw = yf.download(syms, period=period, interval="1d",
+                      group_by="ticker", auto_adjust=False,
+                      threads=True, progress=False)
     data: Dict[str, pd.DataFrame] = {}
 
     def clean(df: pd.DataFrame) -> pd.DataFrame:
         d = df.rename(columns={
-            "Open": "open", "High": "high", "Low": "low", "Close": "close",
-            "Adj Close": "adj_close", "Volume": "volume"
-        }).copy()
-        d = d.dropna(subset=["open", "high", "low", "close", "volume"])
-        bad = (d["open"] <= 0) | (d["high"] <= 0) | (d["low"] <= 0) | (d["close"] <= 0) | (d["volume"] < 0)
-        d = d[~bad]
-        d.index.name = "date"
-        return d[["open", "high", "low", "close", "volume"]]
+            "Open": "open","High":"high","Low":"low","Close":"close",
+            "Adj Close":"adj_close","Volume":"volume"}).copy()
+        d = d.dropna(subset=["open","high","low","close","volume"])
+        bad = (d["open"]<=0)|(d["high"]<=0)|(d["low"]<=0)|(d["close"]<=0)|(d["volume"]<0)
+        d = d[~bad]; d.index.name = "date"
+        return d[["open","high","low","close","volume"]]
 
     if isinstance(raw.columns, pd.MultiIndex):
         top = raw.columns.get_level_values(0)
-        for s in symbols:
+        for s in syms:
             if s in top:
                 data[s] = clean(raw[s].copy())
     else:
-        data[symbols[0]] = clean(raw)
+        data[syms[0]] = clean(raw)
 
-    if BASE_SYMBOL not in data:
-        raise ValueError(f"Missing {BASE_SYMBOL} from Yahoo")
+    if BASE_SYMBOL not in data: raise ValueError(f"Missing {BASE_SYMBOL} from Yahoo")
     base_idx = data[BASE_SYMBOL].index
     for s in list(data.keys()):
         data[s] = data[s].reindex(base_idx).dropna()
 
-    # Soft liquidity screen
     def liq_ok(df: pd.DataFrame) -> pd.Series:
-        adv = (df["close"] * df["volume"]).rolling(30, min_periods=30).mean()
-        daily = df["close"] * df["volume"]
-        return (adv > MIN_DOLLAR_VOL_AVG_30D) & (daily > MIN_DAILY_DOLLAR_VOL)
+        adv = (df["close"]*df["volume"]).rolling(30, min_periods=30).mean()
+        daily = df["close"]*df["volume"]
+        return (adv>MIN_DOLLAR_VOL_AVG_30D) & (daily>MIN_DAILY_DOLLAR_VOL)
 
     keep = {}
     for s, df in data.items():
         m = liq_ok(df)
-        if m.sum() >= int(0.6 * len(m)):
+        if m.sum() >= int(0.6*len(m)):
             keep[s] = df
     if BASE_SYMBOL not in keep:
         keep[BASE_SYMBOL] = data[BASE_SYMBOL]
     return keep
 
-def pct_change_series(s: pd.Series, periods: int) -> pd.Series:
-    return s.pct_change(periods=periods, fill_method=None)
-
-def trailing_return(close: pd.Series, lookback: int, skip: int) -> pd.Series:
-    past = close.shift(skip)
-    ref = past.shift(lookback)
-    return past.divide(ref) - 1.0
-
-def apply_cost(price: float, side: str) -> float:
-    slip = price * (SLIPPAGE_BPS / 10_000)
-    fee = price * (FEE_BPS / 10_000)
-    return price + slip + fee if side == "buy" else price - slip - fee
-
-def round_qty(q: float) -> float:
-    if not np.isfinite(q) or q <= 0: return 0.0
-    return float(np.floor(q * (10 ** QTY_DECIMALS)) / (10 ** QTY_DECIMALS))
-
-def last_day_per_period(idx: pd.DatetimeIndex, freq: str) -> pd.DatetimeIndex:
-    f = (freq or "D").upper()
-    s = idx.to_series()
-    if f == "M":
-        g = s.groupby(idx.to_period("M")).max()
-    elif f == "W":
-        g = s.groupby(idx.to_period("W")).max()
-    elif f == "2W":
-        weekly_last = s.groupby(idx.to_period("W")).max()
-        g = weekly_last.iloc[::2]
-    elif f == "D":
-        g = s
-    else:
-        raise ValueError("freq must be 'D','W','2W','M'")
-    return pd.DatetimeIndex(g.values)
-
-# ------------------------ Strategy (param-driven) ------------------------ #
+# ---------------------------- Strategy Core ------------------------------ #
 
 @dataclass(frozen=True)
 class Params:
-    lookbacks: Tuple[int, int, int]
-    weights: Tuple[float, float, float]
-    skip_recent: int
-    rebalance: str
-    allow_three_when_spread: bool
-    spread_threshold1: float
-    spread_threshold2: float
-    abs_mom_gate_base: float
-    max_weight_min: float
-    max_weight_max: float  # leave wide; user doesn't care
-    cash_buffer_min: float
-    cash_buffer_max: float
-    universe_mode: str
+    # lookbacks (days) strictly descending, ints
+    lb1: int; lb2: int; lb3: int
+    # weights sum to 1.0 (w1>=w2>=w3>=0)
+    w1: float; w2: float; w3: float
+    skip_recent: int            # 0..3
+    abs_gate: float             # -0.02..0.02
+    top_k: int                  # 1..3
+    rebalance: str              # 'D','W','2W','M'
+    max_w: float                # 0.3..1.0
+    cash_buf: float             # 0..0.1
 
-@dataclass
-class Result:
-    params: Params
-    stats: Dict[str, float]
-    bench: Dict[str, float]
+def trailing_return(close: pd.Series, lookback: int, skip: int) -> pd.Series:
+    past = close.shift(skip); ref = past.shift(lookback)
+    return past.divide(ref) - 1.0
 
-def build_panel(data: Dict[str, pd.DataFrame]) -> Tuple[pd.DatetimeIndex, pd.DataFrame, pd.DataFrame]:
+def last_day_per_period(idx: pd.DatetimeIndex, freq: str) -> pd.DatetimeIndex:
+    f = (freq or "D").upper(); s = idx.to_series()
+    if f=="M": g = s.groupby(idx.to_period("M")).max()
+    elif f=="W": g = s.groupby(idx.to_period("W")).max()
+    elif f=="2W": g = s.groupby(idx.to_period("W")).max().iloc[::2]
+    elif f=="D": g = s
+    else: raise ValueError("freq must be 'D','W','2W','M'")
+    return pd.DatetimeIndex(g.values)
+
+def apply_cost(price: float, side: str) -> float:
+    slip = price*(SLIPPAGE_BPS/10_000); fee = price*(FEE_BPS/10_000)
+    return price+slip+fee if side=="buy" else price-slip-fee
+
+def round_qty(q: float) -> float:
+    if not np.isfinite(q) or q<=0: return 0.0
+    return float(np.floor(q*(10**QTY_DECIMALS))/(10**QTY_DECIMALS))
+
+def build_panel(data: Dict[str,pd.DataFrame]) -> Tuple[pd.DatetimeIndex,pd.DataFrame,pd.DataFrame]:
     idx = data[BASE_SYMBOL].index
-    close = pd.DataFrame({s: df["close"] for s, df in data.items()}, index=idx).dropna(how="all")
-    openp = pd.DataFrame({s: df["open"] for s, df in data.items()}, index=idx).reindex(close.index)
+    close = pd.DataFrame({s:df["close"] for s,df in data.items()}, index=idx).dropna(how="all")
+    openp = pd.DataFrame({s:df["open"]  for s,df in data.items()}, index=idx).reindex(close.index)
     return close.index, close, openp
 
-def momentum_score(close: pd.DataFrame, p: Params) -> pd.DataFrame:
-    l1, l2, l3 = p.lookbacks
-    w1, w2, w3 = p.weights
-    m1 = trailing_return(close, l1, p.skip_recent)
-    m2 = trailing_return(close, l2, p.skip_recent)
-    m3 = trailing_return(close, l3, p.skip_recent)
-    return w1 * m1 + w2 * m2 + w3 * m3
-
-# ------------------------ Cash-Fallback Rules ---------------------------- #
-
-def market_guard(dt: pd.Timestamp, close: pd.DataFrame, mom_row: pd.Series) -> bool:
-    """
-    Aggressive circuit breaker to avoid prolonged drawdowns:
-    - If the best momentum is <= abs_gate*0.5 (≈ non-existent) AND
-    - BTC 14d return < 0 AND cross-sectional median 14d return < 0
-    => Go to cash this rebalance.
-    """
-    try:
-        btc = close["BTC-USD"]
-    except Exception:
-        return False
-    if dt not in btc.index: return False
-    idx_pos = close.index.get_loc(dt)
-    if idx_pos < 14: return False
-    r14_btc = float(btc.iloc[idx_pos] / btc.iloc[idx_pos - 14] - 1.0)
-    r14_all = close.iloc[idx_pos] / close.iloc[idx_pos - 14] - 1.0
-    med14 = float(np.nanmedian(r14_all.values))
-    top_mom = float(np.nanmax(mom_row.values))
-    weak_mom = (top_mom <= 0.0)
-    bad_tape = (r14_btc < 0.0) and (med14 < 0.0)
-    return bool(weak_mom and bad_tape)
-
-# ------------------------------ Backtest --------------------------------- #
-
-def run_strategy(data: Dict[str, pd.DataFrame], p: Params) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def run_strategy(data: Dict[str,pd.DataFrame], p: Params) -> pd.DataFrame:
     idx, close, openp = build_panel(data)
-    mom = momentum_score(close, p)
+    # momentum score
+    m1 = trailing_return(close, p.lb1, p.skip_recent)
+    m2 = trailing_return(close, p.lb2, p.skip_recent)
+    m3 = trailing_return(close, p.lb3, p.skip_recent)
+    mom = p.w1*m1 + p.w2*m2 + p.w3*m3
 
-    reb_days = last_day_per_period(idx, 'D')
-
-    largest_lb = max(p.lookbacks) + p.skip_recent + 10
-    first_allowed = idx[0] + pd.Timedelta(days=largest_lb)
+    # rebal calendar
+    reb_days = last_day_per_period(idx, p.rebalance)
+    lag = max(p.lb1, p.lb2, p.lb3) + p.skip_recent + 10
+    first_allowed = idx[0] + pd.Timedelta(days=lag)
     reb_days = reb_days[reb_days >= first_allowed]
 
-    defensive_set = {"USDT-USD", "USDC-USD"}
-
-    cash = START_CAPITAL
-    positions: Dict[str, float] = {}
+    cash = START_CAPITAL; positions: Dict[str,float] = {}
     equity = pd.Series(index=idx, dtype=float)
 
     def pv(dt: pd.Timestamp) -> float:
@@ -216,494 +162,399 @@ def run_strategy(data: Dict[str, pd.DataFrame], p: Params) -> Tuple[pd.DataFrame
         if positions:
             syms = list(positions.keys())
             px = close.loc[dt, syms]
-            v += float(np.nansum(px.values * np.array([positions[s] for s in syms], dtype=float)))
+            v += float(np.nansum(px.values*np.array([positions[s] for s in syms], dtype=float)))
         return v
 
-    mom_np = mom.to_numpy(copy=False)
     cols = list(mom.columns)
-    col_is_def = np.array([c in defensive_set for c in cols], dtype=bool)
-
     for i, dt in enumerate(idx):
         equity.iloc[i] = pv(dt)
-        if dt not in reb_days or i + 1 >= len(idx):
-            continue
+        if dt not in reb_days or i+1>=len(idx): continue
+        t_exec = idx[i+1]; port_val = pv(dt)
+        row = mom.loc[dt].to_numpy(); valid = np.isfinite(row)
 
-        t_exec = idx[i + 1]
-        port_val = pv(dt)
-
-        # Momentum row and guard
-        row = mom_np[i, :]
-        row_series = pd.Series(row, index=cols)
-        if market_guard(dt, close, row_series):
+        # gate
+        gated = valid & (row > p.abs_gate)
+        if not gated.any():
+            # liquidate
             if positions:
                 for s, qty in list(positions.items()):
                     opx = float(openp.loc[t_exec, s]) if s in openp.columns else np.nan
-                    if np.isfinite(opx) and qty > 0:
-                        exec_px = apply_cost(opx, "sell")
-                        cash += qty * exec_px
+                    if np.isfinite(opx) and qty>0:
+                        cash += qty*apply_cost(opx,"sell")
                 positions.clear()
             continue
 
-        valid = np.isfinite(row) & (~col_is_def)
-        gated = valid & (row > p.abs_mom_gate_base)
+        order = np.argsort(row[gated])[::-1]
+        elig_idx = np.where(gated)[0][order]
+        picks = [cols[j] for j in elig_idx[:p.top_k]]
 
-        if gated.any():
-            order = np.argsort(row[gated])[::-1]
-            elig_idx = np.where(gated)[0][order]
-        elif valid.any():
-            order_all = np.argsort(row[valid])[::-1]
-            elig_idx = np.where(valid)[0][order_all]
+        # target sizing
+        usable = 1.0 - p.cash_buf
+        if p.top_k==1 or len(picks)==1:
+            target = {picks[0]: min(p.max_w, usable)}
         else:
-            if positions:
-                for s, qty in list(positions.items()):
-                    opx = float(openp.loc[t_exec, s]) if s in openp.columns else np.nan
-                    if np.isfinite(opx) and qty > 0:
-                        exec_px = apply_cost(opx, "sell")
-                        cash += qty * exec_px
-                positions.clear()
-            continue
+            base = np.linspace(1.0, 0.8, num=len(picks))
+            base = base/base.sum()
+            cap  = np.minimum(base, p.max_w)
+            cap  = cap / cap.sum() * usable
+            target = {s: float(w) for s,w in zip(picks, cap)}
 
-        elig_syms = [cols[j] for j in elig_idx]
-        top_vals = [float(row[j]) if np.isfinite(row[j]) else -np.inf for j in elig_idx[:3]]
+        # current notionals
+        cur_notional = {s: positions.get(s,0.0)*float(close.loc[dt,s]) for s in positions.keys()}
+        tgt_notional = {s: w*port_val for s,w in target.items()}
+        all_syms = sorted(set(list(cur_notional.keys())+list(tgt_notional.keys())))
 
-        picks: List[str] = [elig_syms[0]]
-        spread = 0.0
-
-        if len(elig_syms) >= 2:
-            if (top_vals[0] - top_vals[1]) >= p.spread_threshold1:
-                picks.append(elig_syms[1])
-                spread = max(spread, top_vals[0] - top_vals[1])
-
-        if p.allow_three_when_spread and len(elig_syms) >= 3:
-            if (top_vals[1] - top_vals[2]) >= p.spread_threshold2:
-                picks.append(elig_syms[2])
-                spread = max(spread, top_vals[1] - top_vals[2])
-
-        # dynamic sizing
-        spread_clip = max(0.0, min(0.20, spread))
-        frac = spread_clip / 0.20
-        max_w = p.max_weight_min + (p.max_weight_max - p.max_weight_min) * frac
-        cash_buf = p.cash_buffer_max - (p.cash_buffer_max - p.cash_buffer_min) * frac
-
-        if len(picks) == 1:
-            target_w = {picks[0]: min(max_w, 1.0 - cash_buf)}
-        elif len(picks) == 2:
-            raw = {picks[0]: 1.0, picks[1]: 0.9}
-            ssum = sum(raw.values())
-            raw = {k: v / ssum for k, v in raw.items()}
-            capped = {k: min(max_w, v) for k, v in raw.items()}
-            ssum = sum(capped.values())
-            target_w = {k: (v / ssum) * (1.0 - cash_buf) for k, v in capped.items()} if ssum > 0 else {
-                picks[0]: 1.0 - cash_buf
-            }
-        else:
-            raw = {picks[0]: 1.0, picks[1]: 0.9, picks[2]: 0.8}
-            ssum = sum(raw.values())
-            raw = {k: v / ssum for k, v in raw.items()}
-            capped = {k: min(max_w, v) for k, v in raw.items()}
-            ssum = sum(capped.values())
-            target_w = {k: (v / ssum) * (1.0 - cash_buf) for k, v in capped.items()} if ssum > 0 else {
-                picks[0]: 1.0 - cash_buf
-            }
-
-        target_notional = {s: w * port_val for s, w in target_w.items()}
-        cur_notional = {s: positions.get(s, 0.0) * float(close.loc[dt, s]) for s in positions.keys()}
-        all_syms = sorted(set(list(cur_notional.keys()) + list(target_notional.keys())))
-
-        # Sells
-        for s in all_syms:
-            opx = float(openp.loc[t_exec, s]) if s in openp.columns else np.nan
-            if not np.isfinite(opx):
-                continue
-            tgt = target_notional.get(s, 0.0)
-            cur = cur_notional.get(s, 0.0)
-            diff = tgt - cur
-            if diff < -1e-8 and s in positions:
-                qty = round_qty((-diff) / opx)
-                if qty > 0:
-                    exec_px = apply_cost(opx, "sell")
-                    cash += qty * exec_px
-                    positions[s] = positions.get(s, 0.0) - qty
-                    if positions[s] <= 0: positions.pop(s, None)
-
-        # Buys
+        # sells
         for s in all_syms:
             opx = float(openp.loc[t_exec, s]) if s in openp.columns else np.nan
             if not np.isfinite(opx): continue
-            tgt = target_notional.get(s, 0.0)
-            cur = cur_notional.get(s, 0.0)
-            diff = tgt - cur
-            if diff > 1e-8 and cash > 0:
-                exec_px = apply_cost(opx, "buy")
-                qty = round_qty(min(diff, cash) / exec_px)
-                if qty > 0:
-                    cost = qty * exec_px
-                    if cost <= cash:
+            tgt = tgt_notional.get(s,0.0); cur = cur_notional.get(s,0.0)
+            diff = tgt-cur
+            if diff < -1e-8 and s in positions:
+                qty = round_qty((-diff)/opx)
+                if qty>0:
+                    cash += qty*apply_cost(opx,"sell")
+                    positions[s] = positions.get(s,0.0)-qty
+                    if positions[s]<=0: positions.pop(s,None)
+
+        # buys
+        for s in all_syms:
+            opx = float(openp.loc[t_exec, s]) if s in openp.columns else np.nan
+            if not np.isfinite(opx): continue
+            tgt = tgt_notional.get(s,0.0); cur = cur_notional.get(s,0.0)
+            diff = tgt-cur
+            if diff > 1e-8 and cash>0:
+                bpx = apply_cost(opx,"buy")
+                qty = round_qty(min(diff,cash)/bpx)
+                if qty>0:
+                    cost = qty*bpx
+                    if cost<=cash:
                         cash -= cost
-                        positions[s] = positions.get(s, 0.0) + qty
+                        positions[s] = positions.get(s,0.0)+qty
 
-    if len(idx) > 0:
-        equity.iloc[-1] = pv(idx[-1])
-    equity_df = equity.to_frame("equity")
-
-    # Benchmark: BTC buy & hold
+    if len(idx)>0: equity.iloc[-1] = pv(idx[-1])
+    df = pd.DataFrame(index=idx)
     base_close = data[BASE_SYMBOL]["close"].reindex(idx).dropna()
-    bench_equity = (START_CAPITAL * (base_close / base_close.iloc[0])).reindex(idx).ffill()
-    equity_df["benchmark"] = bench_equity
-    return equity_df, close
+    bench = (START_CAPITAL*(base_close/base_close.iloc[0])).reindex(idx).ffill()
+    df["equity"] = equity
+    df["benchmark"] = bench
+    return df
 
-# ----------------------- Fitness & Statistics ---------------------------- #
-
-def compute_stats(equity: pd.Series) -> Dict[str, float]:
+def compute_stats(equity: pd.Series) -> Dict[str,float]:
     eq = equity.dropna()
-    if len(eq) < 2:
-        return {k: np.nan for k in ["CAGR", "TotalReturn", "MaxDD", "Vol", "Sharpe", "MAR",
-                                    "MaxDDDuration", "CAGR_5Y"]}
+    if len(eq)<2: return {k: np.nan for k in ["CAGR","TotalReturn","MaxDD","Vol","Sharpe","MAR","MaxDDDuration"]}
     rets = eq.pct_change().iloc[1:]
-    total = float(eq.iloc[-1] / eq.iloc[0] - 1.0)
-    days = (eq.index[-1] - eq.index[0]).days
-    years = days / 365.25 if days > 0 else np.nan
-    cagr = (1 + total) ** (1 / years) - 1 if years and years > 0 else np.nan
-    dd = (eq / eq.cummax() - 1.0)
+    total = float(eq.iloc[-1]/eq.iloc[0]-1.0)
+    days = (eq.index[-1]-eq.index[0]).days
+    years = days/365.25 if days>0 else np.nan
+    cagr = (1+total)**(1/years)-1 if years and years>0 else np.nan
+    dd = (eq/eq.cummax()-1.0)
     maxdd = float(dd.min()) if len(dd) else np.nan
-    vol = float(rets.std() * np.sqrt(365)) if rets.std() > 0 else np.nan
-    sharpe = float(rets.mean() / rets.std() * np.sqrt(365)) if rets.std() > 0 else np.nan
-    mar = float(cagr / abs(maxdd)) if (isinstance(maxdd, float) and maxdd < 0 and not np.isnan(cagr)) else np.nan
-
-    under = dd < 0
-    max_len = 0
-    cur_len = 0
+    vol = float(rets.std()*np.sqrt(365)) if rets.std()>0 else np.nan
+    sharpe = float(rets.mean()/rets.std()*np.sqrt(365)) if rets.std()>0 else np.nan
+    mar = float(cagr/abs(maxdd)) if (isinstance(maxdd,float) and maxdd<0 and not np.isnan(cagr)) else np.nan
+    under = dd<0; max_len=0; cur_len=0
     for flag in under.astype(int).values:
-        if flag:
-            cur_len += 1
-            if cur_len > max_len:
-                max_len = cur_len
-        else:
-            cur_len = 0
+        if flag: cur_len+=1; max_len=max(max_len,cur_len)
+        else: cur_len=0
+    return {"CAGR":cagr,"TotalReturn":total,"MaxDD":maxdd,"Vol":vol,"Sharpe":sharpe,"MAR":mar,"MaxDDDuration":float(max_len)}
 
-    end_date = eq.index[-1]
-    start_5y = end_date - pd.Timedelta(days=int(365.25 * 5))
-    eq5 = eq[eq.index >= start_5y]
-    if len(eq5) >= 2:
-        total5 = float(eq5.iloc[-1] / eq5.iloc[0] - 1.0)
-        yrs5 = (eq5.index[-1] - eq5.index[0]).days / 365.25
-        cagr5 = (1 + total5) ** (1 / yrs5) - 1 if yrs5 > 0 else np.nan
-    else:
-        cagr5 = np.nan
+# ---------------------------- Walk-Forward -------------------------------- #
 
-    return {"CAGR": cagr, "TotalReturn": total, "MaxDD": maxdd, "Vol": vol,
-            "Sharpe": sharpe, "MAR": mar, "MaxDDDuration": float(max_len), "CAGR_5Y": cagr5}
+def kfold_time_indices(idx: pd.DatetimeIndex, k: int) -> List[Tuple[pd.Timestamp,pd.Timestamp]]:
+    n = len(idx); folds=[]
+    seg = n//k
+    for i in range(k):
+        a = i*seg
+        b = (i+1)*seg if i<k-1 else n
+        folds.append((idx[a], idx[b-1]))
+    return folds
 
-def fitness(res: Result) -> float:
-    cagr = res.stats.get("CAGR", np.nan)
-    dd = res.stats.get("MaxDD", np.nan)
-    sharpe = res.stats.get("Sharpe", np.nan)
-    bench_cagr = res.bench.get("CAGR", np.nan)
-    dd_dur = res.stats.get("MaxDDDuration", np.nan)
-    cagr5 = res.stats.get("CAGR_5Y", np.nan)
+def evaluate_params(data: Dict[str,pd.DataFrame], p: Params) -> Tuple[float,float,float]:
+    """Return objectives for NSGA-II: f1 = -CAGR_med, f2 = |MaxDD|_med, and MAR_med (for tie-break/report)."""
+    idx = data[BASE_SYMBOL].index
+    folds = kfold_time_indices(idx, KFOLDS)
+    cagr_list=[]; dd_list=[]; mar_list=[]
+    for (a,b) in folds:
+        sub_data = {s: df[(df.index>=a)&(df.index<=b)] for s,df in data.items()}
+        # Skip tiny segments
+        if any(len(df)<250 for df in sub_data.values()): continue
+        eq = run_strategy(sub_data, p)
+        st = compute_stats(eq["equity"])
+        if not np.isfinite(st["CAGR"]) or not np.isfinite(st["MaxDD"]): continue
+        cagr_list.append(st["CAGR"]); dd_list.append(abs(st["MaxDD"])); mar_list.append(st["MAR"] if np.isfinite(st["MAR"]) else 0.0)
+    if not cagr_list: return 1e6, 1e6, -1e6
+    c_med = float(np.median(cagr_list)); d_med = float(np.median(dd_list)); m_med=float(np.median(mar_list))
+    return -c_med, d_med, m_med
 
+# --------------------------- NSGA-II Toolkit ------------------------------ #
 
-    if any(np.isnan(x) for x in [cagr, dd, bench_cagr, dd_dur, cagr5]):
-        return -1e9
+def dominates(a,b):
+    return (a[0]<=b[0] and a[1]<=b[1]) and (a[0]<b[0] or a[1]<b[1])
 
-    edge = cagr - bench_cagr
+def fast_non_dominated_sort(objs: List[Tuple[float,float]]):
+    S=[[] for _ in objs]; n=[0]*len(objs); fronts=[[]]
+    for p in range(len(objs)):
+        for q in range(len(objs)):
+            if dominates(objs[p], objs[q]): S[p].append(q)
+            elif dominates(objs[q], objs[p]): n[p]+=1
+        if n[p]==0: fronts[0].append(p)
+    i=0
+    while len(fronts[i])>0:
+        Q=[]
+        for p in fronts[i]:
+            for q in S[p]:
+                n[q]-=1
+                if n[q]==0: Q.append(q)
+        i+=1; fronts.append(Q)
+    fronts.pop()
+    return fronts
 
-    pen = 0.0
-    if dd_dur > MAX_DD_DURATION_DAYS:
-        return -1e9
-    if dd < -0.85:
-        pen += (abs(dd) - 0.85) * 50.0
-    if cagr5 < REQUIRED_CAGR_5Y:
-        pen += (REQUIRED_CAGR_5Y - cagr5) * 500.0
+def crowding_distance(front: List[int], objs: List[Tuple[float,float]]):
+    if not front: return {}
+    dist={i:0.0 for i in front}
+    for m in range(2):
+        front_sorted=sorted(front, key=lambda i: objs[i][m])
+        dist[front_sorted[0]]=dist[front_sorted[-1]]=float("inf")
+        vals=[objs[i][m] for i in front_sorted]
+        vmin, vmax = min(vals), max(vals)
+        if vmax==vmin: continue
+        for j in range(1,len(front_sorted)-1):
+            prev=objs[front_sorted[j-1]][m]; nxt=objs[front_sorted[j+1]][m]
+            dist[front_sorted[j]] += (nxt-prev)/(vmax-vmin)
+    return dist
 
-    return edge * 260.0 + (sharpe if not np.isnan(sharpe) else 0.0) * 2.0 - pen
+def tournament(pop, objs, k=TOURNAMENT_K):
+    cand = random.sample(range(len(pop)), k)
+    fronts = fast_non_dominated_sort([objs[i] for i in cand])
+    best_idx = fronts[0][0]
+    # pick by crowding
+    cd = crowding_distance(fronts[0], [objs[c] for c in cand])
+    win = cand[ max(fronts[0], key=lambda i: cd[i]) ]
+    return pop[win]
 
-def evaluate(data: Dict[str, pd.DataFrame], p: Params) -> Result:
-    eq, _ = run_strategy(data, p)
-    stats = compute_stats(eq["equity"])
-    bench = compute_stats(eq["benchmark"])
-    return Result(params=p, stats=stats, bench=bench)
+# ----------------------- Encoding / Variation Ops ------------------------ #
 
-# --------------------------- Search Space -------------------------------- #
+REB_CHOICES = ['D','W','2W','M']
 
-LB_OPTIONS = [
-    (63, 21, 7), (42, 14, 7), (28, 14, 7),
-    (21, 10, 5), (14, 7, 3),
-    (10, 5, 2), (7, 3, 1), (5, 2, 1), (3, 1, 0),
-]
-WT_OPTIONS = [
-    (0.9, 0.08, 0.02),
-    (0.8, 0.15, 0.05),
-    (0.7, 0.2, 0.1),
-    (0.6, 0.3, 0.1),
-    (0.5, 0.3, 0.2),
-]
-SKIP_OPTIONS = [0, 1, 2]
-GATE_OPTIONS = [-0.02, 0.000, 0.005]
-SPREAD_OPTIONS = [0.001, 0.003, 0.005]
+def lhs_sample(n, dims):
+    """Latin Hypercube Sampling in [0,1]^dims"""
+    cut = np.linspace(0,1,n+1)
+    u = np.random.rand(n,dims)
+    a = cut[:n]; b = cut[1:n+1]
+    rdpoints = u*(b-a)[:,None] + a[:,None]
+    H = np.zeros_like(rdpoints)
+    for j in range(dims):
+        order = np.random.permutation(n)
+        H[:,j] = rdpoints[order,j]
+    return H
 
-def random_params() -> Params:
-    return Params(
-        lookbacks=random.choice(LB_OPTIONS),
-        weights=random.choice(WT_OPTIONS),
-        skip_recent=random.choice(SKIP_OPTIONS),
-        rebalance='D',
-        allow_three_when_spread=True,
-        spread_threshold1=random.choice(SPREAD_OPTIONS),
-        spread_threshold2=random.choice(SPREAD_OPTIONS),
-        abs_mom_gate_base=random.choice(GATE_OPTIONS),
-        max_weight_min=1.00,
-        max_weight_max=2.50,
-        cash_buffer_min=0.00,
-        cash_buffer_max=0.05,
-        universe_mode="EXT",
-    )
+def decode(vec) -> Params:
+    # vec in [0,1]^10
+    lb_max=180
+    a1 = int(3 + vec[0]*(lb_max-3))
+    a2 = int(1 + vec[1]*(a1-1))
+    a3 = int(0 + vec[2]*max(0,a2))
+    # weights sorted, sum=1
+    r1, r2, r3 = sorted([vec[3],vec[4],vec[5]], reverse=True)
+    s = r1+r2+r3 + 1e-12
+    w1,w2,w3 = r1/s, r2/s, r3/s
+    skip = int(vec[6]*3+0.5)
+    gate = -0.02 + vec[7]*0.04
+    topk = 1 + int(vec[8]*2+0.5)  # 1..3
+    reb  = REB_CHOICES[min(int(vec[9]*len(REB_CHOICES)), len(REB_CHOICES)-1)]
+    # extra two knobs derived for simplicity
+    max_w = 0.3 + 0.7*vec[3]
+    cash_buf = 0.10*vec[4]
+    return Params(a1,a2,a3, w1,w2,w3, skip, gate, topk, reb, max_w, cash_buf)
 
-def mutate(p: Params, rate: float = 0.70) -> Params:
-    def flip(cur, opts):
-        return random.choice([o for o in opts if o != cur]) if random.random() < rate else cur
-    return Params(
-        lookbacks=flip(p.lookbacks, LB_OPTIONS),
-        weights=flip(p.weights, WT_OPTIONS),
-        skip_recent=flip(p.skip_recent, SKIP_OPTIONS),
-        rebalance='D',
-        allow_three_when_spread=True,
-        spread_threshold1=flip(p.spread_threshold1, SPREAD_OPTIONS),
-        spread_threshold2=flip(p.spread_threshold2, SPREAD_OPTIONS),
-        abs_mom_gate_base=flip(p.abs_mom_gate_base, GATE_OPTIONS),
-        max_weight_min=1.00,
-        max_weight_max=2.50,
-        cash_buffer_min=0.00,
-        cash_buffer_max=0.05,
-        universe_mode=p.universe_mode,
-    )
-
-def crossover(a: Params, b: Params) -> Params:
-    pick = lambda x, y: random.choice([x, y])
-    return Params(
-        lookbacks=pick(a.lookbacks, b.lookbacks),
-        weights=pick(a.weights, b.weights),
-        skip_recent=pick(a.skip_recent, b.skip_recent),
-        rebalance='D',
-        allow_three_when_spread=True,
-        spread_threshold1=pick(a.spread_threshold1, b.spread_threshold1),
-        spread_threshold2=pick(a.spread_threshold2, b.spread_threshold2),
-        abs_mom_gate_base=pick(a.abs_mom_gate_base, b.abs_mom_gate_base),
-        max_weight_min=1.00,
-        max_weight_max=2.50,
-        cash_buffer_min=0.00,
-        cash_buffer_max=0.05,
-        universe_mode=a.universe_mode,
-    )
-
-# --------------------------- Evolution Loop ------------------------------ #
-
-def evolutionary_search(
-        data: Dict[str, pd.DataFrame],
-        population_size: int = 120,
-        generations: int = 220,
-        elite_frac: float = 0.05,
-        mutation_rate: float = 0.70,
-        seed: Optional[int] = 42,
-        stagnation_patience: int = 20,
-        min_improve: float = 1e-6,
-        soft_reset_frac: float = 0.30,
-) -> Tuple[List[Result], Result]:
-    if seed is not None:
-        random.seed(seed)
-        np.random.seed(seed)
-
-    pop = [random_params() for _ in range(population_size)]
-    results: List[Result] = []
-
-    best_score = -np.inf
-    last_improve_gen = -1
-
-    def fmt_pct(x: float) -> str:
-        return f"{x * 100:.2f}%" if np.isfinite(x) else "nan"
-
-    for gen in range(generations):
-        gen_results = [evaluate(data, p) for p in pop]
-        gen_results.sort(key=lambda r: fitness(r), reverse=True)
-        best = gen_results[0]
-        cur_best_score = fitness(best)
-
-        print(
-            f"[Gen {gen + 1}/{generations}] "
-            f"Score={cur_best_score:.2f} | "
-            f"CAGR={fmt_pct(best.stats['CAGR'])} vs BTC {fmt_pct(best.bench['CAGR'])} | "
-            f"DD={fmt_pct(best.stats['MaxDD'])} | "
-            f"DD_Dur={best.stats['MaxDDDuration']:.0f}d | "
-            f"CAGR_5Y={fmt_pct(best.stats['CAGR_5Y'])} | "
-            f"LBs={best.params.lookbacks} | Wts={best.params.weights} | "
-            f"AbsGate>{best.params.abs_mom_gate_base * 100:.2f}% | Reb={best.params.rebalance} | "
-            f"MaxW=[{best.params.max_weight_min:.2f},{best.params.max_weight_max:.2f}] | "
-            f"Spread>{best.params.spread_threshold1 * 100:.2f}%/{best.params.spread_threshold2 * 100:.2f}%"
-        )
-        results.extend(gen_results)
-
-        if cur_best_score > best_score + min_improve:
-            best_score = cur_best_score
-            last_improve_gen = gen
-
-        # Stagnation check → optional one-time soft reset then exit if still stuck
-        if (gen - last_improve_gen) >= stagnation_patience:
-            print(f"[EarlyStop] Stagnation detected for {stagnation_patience} generations. Best score={best_score:.2f}.")
-            # Soft reset injection
-            inject_n = int(soft_reset_frac * population_size)
-            if inject_n > 0:
-                print(f"[SoftReset] Injecting {inject_n}/{population_size} random individuals.")
-                # Preserve current elite to keep best found so far
-                n_elite = max(1, int(elite_frac * population_size))
-                elite_params = [r.params for r in gen_results[:n_elite]]
-                survivors = [r.params for r in gen_results[n_elite:population_size - inject_n]]
-                new_randoms = [random_params() for _ in range(inject_n)]
-                pop = elite_params + survivors + new_randoms
-
-                # Evaluate one extra generation post-reset
-                post_results = [evaluate(data, p) for p in pop]
-                post_results.sort(key=lambda r: fitness(r), reverse=True)
-                post_best = post_results[0]
-                post_score = fitness(post_best)
-                results.extend(post_results)
-                print(f"[PostReset] Score={post_score:.2f} | CAGR={fmt_pct(post_best.stats['CAGR'])} | DD_Dur={post_best.stats['MaxDDDuration']:.0f}d")
-
-                if post_score > best_score + min_improve:
-                    best_score = post_score
-                    last_improve_gen = gen + 1  # mark improvement
-                else:
-                    print("[EarlyStop] No improvement after soft reset. Exiting.")
-                    results.sort(key=lambda r: fitness(r), reverse=True)
-                    return results, results[0]
+def sbx_crossover(u, v, etac=15.0):
+    n=len(u); child1=u.copy(); child2=v.copy()
+    for i in range(n):
+        if random.random()>0.5:
+            x1=min(u[i],v[i]); x2=max(u[i],v[i])
+            if abs(x1-x2)<1e-12: continue
+            rand=random.random()
+            beta=1.0+2.0*(x1-0.0)/(x2-x1)
+            alpha=2.0 - beta**-(etac+1)
+            if rand<=1.0/alpha:
+                betaq=(rand*alpha)**(1.0/(etac+1))
             else:
-                print("[EarlyStop] Exiting without soft reset.")
-                results.sort(key=lambda r: fitness(r), reverse=True)
-                return results, results[0]
+                betaq=(1.0/(2.0 - rand*alpha))**(1.0/(etac+1))
+            c1=0.5*((x1+x2) - betaq*(x2-x1))
+            beta=1.0+2.0*(1.0-x2)/(x2-x1)
+            alpha=2.0 - beta**-(etac+1)
+            if rand<=1.0/alpha:
+                betaq=(rand*alpha)**(1.0/(etac+1))
+            else:
+                betaq=(1.0/(2.0 - rand*alpha))**(1.0/(etac+1))
+            c2=0.5*((x1+x2) + betaq*(x2-x1))
+            c1=max(0.0,min(1.0,c1)); c2=max(0.0,min(1.0,c2))
+            child1[i]=c1; child2[i]=c2
+    return child1, child2
 
-        # Regular next-generation construction
-        n_elite = max(1, int(elite_frac * population_size))
-        elite_params = [r.params for r in gen_results[:n_elite]]
-        parent_pool = [r.params for r in gen_results[: max(n_elite * 4, n_elite + 8)]]
+def poly_mutation(u, etam=20.0, p=0.2):
+    child=u.copy()
+    for i in range(len(u)):
+        if random.random()<p:
+            r=random.random()
+            if r<0.5:
+                delta=(2*r)**(1/(etam+1)) - 1
+            else:
+                delta=1 - (2*(1-r))**(1/(etam+1))
+            child[i]=min(1.0, max(0.0, u[i]+delta*0.1))
+    return child
 
-        children: List[Params] = []
-        while len(children) < population_size - n_elite:
-            pa = random.choice(elite_params)
-            pb = random.choice(parent_pool)
-            child = crossover(pa, pb)
-            child = mutate(child, rate=mutation_rate)
-            children.append(child)
+# ----------------------------- Main Search -------------------------------- #
 
-        pop = elite_params + children
+def hypervolume_2d(front: List[Tuple[float,float]], ref=(1e3,1e3)):
+    # front in objective space (minimization). Compute dominated area to ref.
+    pareto = sorted(front, key=lambda x:(x[0],x[1]))
+    hv=0.0; prev_f2=ref[1]
+    for f1,f2 in pareto:
+        if f2<prev_f2:
+            hv += (ref[0]-f1)*(prev_f2-f2)
+            prev_f2=f2
+    return hv
 
-    results.sort(key=lambda r: fitness(r), reverse=True)
-    return results, results[0]
-
-# ------------------------------- I/O ------------------------------------- #
-
-def save_results(all_results: List[Result], best: Result, tag: str) -> None:
+def nsga2_optimize(data: Dict[str,pd.DataFrame]):
     os.makedirs(OUT_DIR, exist_ok=True)
-    rows = []
-    for r in all_results:
-        rows.append({
-            "score": fitness(r),
-            "CAGR": r.stats.get("CAGR"),
-            "TotalReturn": r.stats.get("TotalReturn"),
-            "MaxDD": r.stats.get("MaxDD"),
-            "Sharpe": r.stats.get("Sharpe"),
-            "MAR": r.stats.get("MAR"),
-            "Bench_CAGR": r.bench.get("CAGR"),
-            "MaxDDDuration": r.stats.get("MaxDDDuration"),
-            "CAGR_5Y": r.stats.get("CAGR_5Y"),
-            "lookbacks": r.params.lookbacks,
-            "weights": r.params.weights,
-            "skip_recent": r.params.skip_recent,
-            "rebalance": r.params.rebalance,
-            "allow_three_when_spread": r.params.allow_three_when_spread,
-            "spread_threshold1": r.params.spread_threshold1,
-            "spread_threshold2": r.params.spread_threshold2,
-            "abs_mom_gate_base": r.params.abs_mom_gate_base,
-            "max_weight_min": r.params.max_weight_min,
-            "max_weight_max": r.params.max_weight_max,
-            "cash_buffer_min": r.params.cash_buffer_min,
-            "cash_buffer_max": r.params.cash_buffer_max,
-            "universe_mode": r.params.universe_mode,
-        })
-    df = pd.DataFrame(rows).sort_values("score", ascending=False).head(400)
-    df.to_csv(f"{OUT_DIR}/optimizer_results_ame_v4p6_ultra_crypto.csv", index=False)
 
-    manifest = {
-        "best_params": {
-            "lookbacks": best.params.lookbacks,
-            "weights": best.params.weights,
-            "skip_recent": best.params.skip_recent,
-            "rebalance": best.params.rebalance,
-            "allow_three_when_spread": best.params.allow_three_when_spread,
-            "spread_threshold1": best.params.spread_threshold1,
-            "spread_threshold2": best.params.spread_threshold2,
-            "abs_mom_gate_base": best.params.abs_mom_gate_base,
-            "max_weight_min": best.params.max_weight_min,
-            "max_weight_max": best.params.max_weight_max,
-            "cash_buffer_min": best.params.cash_buffer_min,
-            "cash_buffer_max": best.params.cash_buffer_max,
-            "universe_mode": best.params.universe_mode,
-        },
-        "best_stats": best.stats,
-        "best_benchmark": best.bench,
-        "constraints": {
-            "MaxDDDurationDays": MAX_DD_DURATION_DAYS,
-            "RequiredCAGR5Y": REQUIRED_CAGR_5Y,
-        }
-    }
-    with open(f"{OUT_DIR}/optimizer_manifest_ame_v4p6_ultra_crypto.json", "w") as f:
-        json.dump(manifest, f, indent=2)
+    # LHS init
+    n_init = max(POP_SIZE, LHS_INIT_FACTOR*10)
+    H = lhs_sample(n_init, 10)
+    pop = [H[i].tolist() for i in range(n_init)]
+    random.shuffle(pop)
+    pop = pop[:POP_SIZE]
 
-# -------------------------------- Main ----------------------------------- #
+    # Evaluate
+    objs=[]; extras=[]
+    for x in pop:
+        p=decode(x)
+        f1,f2,mar = evaluate_params(data,p)
+        objs.append((f1,f2)); extras.append(mar)
 
-def main():
-    universe = _dedupe(UNIVERSE)
-    print(f"Downloading {len(universe)} tickers...")
-    data = fetch_data(universe)
-    print(f"Universe after hygiene: {len(data)} tickers")
+    best_hv=-float("inf"); stall=0
 
-    all_results, best = evolutionary_search(
-        data,
-        population_size=120,
-        generations=220,
-        elite_frac=0.05,
-        mutation_rate=0.70,
-        seed=42,
-        stagnation_patience=20,
-        min_improve=1e-6,
-        soft_reset_frac=0.30,
-    )
+    for gen in range(GENERATIONS):
+        # Non-dominated sorting
+        fronts = fast_non_dominated_sort(objs)
+        # Selection (elitism)
+        new_pop=[]; new_objs=[]; new_extras=[]
+        for front in fronts:
+            if len(new_pop)+len(front) > POP_SIZE:
+                cd = crowding_distance(front, objs)
+                order = sorted(front, key=lambda i: cd[i], reverse=True)
+                needed = POP_SIZE - len(new_pop)
+                for idx in order[:needed]:
+                    new_pop.append(pop[idx]); new_objs.append(objs[idx]); new_extras.append(extras[idx])
+                break
+            else:
+                for idx in front:
+                    new_pop.append(pop[idx]); new_objs.append(objs[idx]); new_extras.append(extras[idx])
+        pop, objs, extras = new_pop, new_objs, new_extras
 
-    save_results(all_results, best, tag="v4p6_ultra_crypto")
+        # Reproduction
+        children=[]
+        while len(children)<POP_SIZE:
+            p1 = tournament(pop, objs)
+            p2 = tournament(pop, objs)
+            c1, c2 = p1[:], p2[:]
+            if random.random()<CXPB:
+                c1,c2 = sbx_crossover(p1,p2)
+            if random.random()<MUTPB:
+                c1 = poly_mutation(c1)
+            if random.random()<MUTPB:
+                c2 = poly_mutation(c2)
+            children.extend([c1,c2])
+        children = children[:POP_SIZE]
 
-    print("\nBest Configuration:")
-    print(best.params)
-    print("Strategy Stats:")
-    for k, v in best.stats.items():
-        print(f"{k}: {v:.4%}" if isinstance(v, float) and np.isfinite(v) else f"{k}: {v}")
-    print("Benchmark (BTC-USD) Stats:")
-    for k, v in best.bench.items():
-        print(f"{k}: {v:.4%}" if isinstance(v, float) and np.isfinite(v) else f"{k}: {v}")
-    print(f"Score: {fitness(best):.2f}")
+        # Evaluate children
+        child_objs=[]; child_extras=[]
+        for x in children:
+            p=decode(x)
+            f1,f2,mar = evaluate_params(data,p)
+            child_objs.append((f1,f2)); child_extras.append(mar)
 
+        # Combine and select next gen
+        comb_pop = pop+children
+        comb_objs = objs+child_objs
+        comb_extras= extras+child_extras
+        fronts = fast_non_dominated_sort(comb_objs)
+        next_pop=[]; next_objs=[]; next_extras=[]
+        for front in fronts:
+            if len(next_pop)+len(front) > POP_SIZE:
+                cd = crowding_distance(front, comb_objs)
+                order = sorted(front, key=lambda i: cd[i], reverse=True)
+                needed = POP_SIZE - len(next_pop)
+                for idx in order[:needed]:
+                    next_pop.append(comb_pop[idx]); next_objs.append(comb_objs[idx]); next_extras.append(comb_extras[idx])
+                break
+            else:
+                for idx in front:
+                    next_pop.append(comb_pop[idx]); next_objs.append(comb_objs[idx]); next_extras.append(comb_extras[idx])
+        pop, objs, extras = next_pop, next_objs, next_extras
+
+        # Early stop by hypervolume
+        # reference point: (max f1, max f2) approximation
+        fronts = fast_non_dominated_sort(objs)
+        front0 = fronts[0]
+        cur_front = [objs[i] for i in front0]
+        ref = (max(f for f,_ in cur_front)+1.0, max(s for _,s in cur_front)+1.0)
+        hv = hypervolume_2d(cur_front, ref)
+        if hv <= best_hv*(1+HYPERVOL_EPS) and hv<=best_hv:
+            stall+=1
+        else:
+            best_hv=hv; stall=0
+        print(f"[Gen {gen+1}/{GENERATIONS}] Pareto={len(front0)} | HV={hv:.4f} | stall={stall}")
+
+        if stall>=EARLYSTOP_PATIENCE:
+            print("[EarlyStop] Hypervolume stalled. Exiting.")
+            break
+
+    # Final Pareto
+    fronts = fast_non_dominated_sort(objs)
+    pf_idx = fronts[0]
+    pareto = []
+    for i in pf_idx:
+        p = decode(pop[i]); f1,f2 = objs[i]
+        pareto.append({"params":p.__dict__, "obj": {"neg_CAGR_med": f1, "MaxDD_med": f2, "MAR_med": extras[i]}})
+    pareto_sorted = sorted(pareto, key=lambda r: (r["obj"]["neg_CAGR_med"], r["obj"]["MaxDD_med"]))
+
+    # Save
+    os.makedirs(OUT_DIR, exist_ok=True)
+    with open(f"{OUT_DIR}/pareto_nsga2.json","w") as f:
+        json.dump(pareto_sorted, f, indent=2, default=lambda o: o.__dict__ if hasattr(o,'__dict__') else str(o))
+    print(f"Saved Pareto: {OUT_DIR}/pareto_nsga2.json")
+
+    # Pick single best by MAR_med subject to mild MaxDD bound (median)
+    cand = sorted(pareto_sorted, key=lambda r: (-r["obj"]["MAR_med"], r["obj"]["MaxDD_med"]))
+    best = cand[0]
+    with open(f"{OUT_DIR}/best_nsga2.json","w") as f:
+        json.dump(best, f, indent=2)
+    print(f"Saved Best: {OUT_DIR}/best_nsga2.json")
+
+    # Plot equity for the chosen params (optional)
     try:
-        eq, _ = run_strategy(data, best.params)
         import matplotlib.pyplot as plt
-        plt.figure()
-        eq[["equity", "benchmark"]].plot()
-        plt.title("AME-V4.6-ULTRA-CRYPTO Best Strategy vs BTC-USD")
-        plt.xlabel("Date")
-        plt.ylabel("Equity")
+        p = Params(**best["params"])
+        eq = run_strategy(data, p)
+        eq[["equity","benchmark"]].plot()
+        plt.title("Best NSGA-II Strategy vs BTC-USD")
         plt.tight_layout()
-        fp = f"{OUT_DIR}/optimizer_ame_v4p6_ultra_crypto_best_equity.png"
-        plt.savefig(fp)
-        plt.close()
+        fp = f"{OUT_DIR}/best_nsga2_equity.png"
+        plt.savefig(fp); plt.close()
         print(f"Saved: {fp}")
     except Exception as e:
         print(f"Plot skipped: {e}")
+
+# --------------------------------- Main ---------------------------------- #
+
+def main():
+    print(f"Downloading {len(UNIVERSE)} tickers...")
+    data = fetch_data(UNIVERSE)
+    print(f"Universe after hygiene: {len(data)} tickers")
+    nsga2_optimize(data)
 
 if __name__ == "__main__":
     main()
