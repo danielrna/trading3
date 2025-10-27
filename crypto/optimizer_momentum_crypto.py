@@ -178,27 +178,19 @@ def market_guard(dt: pd.Timestamp, close: pd.DataFrame, mom_row: pd.Series) -> b
     - BTC 14d return < 0 AND cross-sectional median 14d return < 0
     => Go to cash this rebalance.
     """
-    # 14d returns
     try:
         btc = close["BTC-USD"]
     except Exception:
         return False
-    # guard when recent returns are decisively negative
     if dt not in btc.index: return False
     idx_pos = close.index.get_loc(dt)
     if idx_pos < 14: return False
     r14_btc = float(btc.iloc[idx_pos] / btc.iloc[idx_pos - 14] - 1.0)
-    # breadth via median of top universe 14d ret
     r14_all = close.iloc[idx_pos] / close.iloc[idx_pos - 14] - 1.0
     med14 = float(np.nanmedian(r14_all.values))
-
-    # best raw momentum signal
     top_mom = float(np.nanmax(mom_row.values))
-
-    # thresholds
-    weak_mom = (top_mom <= 0.0)  # super strict: require positive momentum to be long
+    weak_mom = (top_mom <= 0.0)
     bad_tape = (r14_btc < 0.0) and (med14 < 0.0)
-
     return bool(weak_mom and bad_tape)
 
 # ------------------------------ Backtest --------------------------------- #
@@ -243,7 +235,6 @@ def run_strategy(data: Dict[str, pd.DataFrame], p: Params) -> Tuple[pd.DataFrame
         row = mom_np[i, :]
         row_series = pd.Series(row, index=cols)
         if market_guard(dt, close, row_series):
-            # Full cash this rebalance to cut drawdown duration
             if positions:
                 for s, qty in list(positions.items()):
                     opx = float(openp.loc[t_exec, s]) if s in openp.columns else np.nan
@@ -263,7 +254,6 @@ def run_strategy(data: Dict[str, pd.DataFrame], p: Params) -> Tuple[pd.DataFrame
             order_all = np.argsort(row[valid])[::-1]
             elig_idx = np.where(valid)[0][order_all]
         else:
-            # liquidate to cash
             if positions:
                 for s, qty in list(positions.items()):
                     opx = float(openp.loc[t_exec, s]) if s in openp.columns else np.nan
@@ -380,9 +370,7 @@ def compute_stats(equity: pd.Series) -> Dict[str, float]:
     sharpe = float(rets.mean() / rets.std() * np.sqrt(365)) if rets.std() > 0 else np.nan
     mar = float(cagr / abs(maxdd)) if (isinstance(maxdd, float) and maxdd < 0 and not np.isnan(cagr)) else np.nan
 
-    # Drawdown duration (longest stretch under previous peak)
     under = dd < 0
-    # compute longest run length
     max_len = 0
     cur_len = 0
     for flag in under.astype(int).values:
@@ -393,7 +381,6 @@ def compute_stats(equity: pd.Series) -> Dict[str, float]:
         else:
             cur_len = 0
 
-    # Last-5Y CAGR
     end_date = eq.index[-1]
     start_5y = end_date - pd.Timedelta(days=int(365.25 * 5))
     eq5 = eq[eq.index >= start_5y]
@@ -418,23 +405,15 @@ def fitness(res: Result) -> float:
     if any(np.isnan(x) for x in [cagr, dd, bench_cagr, dd_dur, cagr5]):
         return -1e9
 
-    # Base edge on CAGR vs BTC
     edge = cagr - bench_cagr
 
-    # Penalties
     pen = 0.0
-
-    # Hard penalty for prolonged drawdown duration
     if dd_dur > MAX_DD_DURATION_DAYS:
-        pen += (dd_dur - MAX_DD_DURATION_DAYS) * 15.0  # strong per-day penalty
-
-    # Soft penalty for very deep DD (still tolerate aggression)
+        pen += (dd_dur - MAX_DD_DURATION_DAYS) * 15.0
     if dd < -0.85:
         pen += (abs(dd) - 0.85) * 50.0
-
-    # Enforce last-5Y CAGR >= 200%
     if cagr5 < REQUIRED_CAGR_5Y:
-        pen += (REQUIRED_CAGR_5Y - cagr5) * 500.0  # heavy shortfall penalty
+        pen += (REQUIRED_CAGR_5Y - cagr5) * 500.0
 
     return edge * 260.0 + (sharpe if not np.isnan(sharpe) else 0.0) * 2.0 - pen
 
@@ -459,7 +438,7 @@ WT_OPTIONS = [
     (0.5, 0.3, 0.2),
 ]
 SKIP_OPTIONS = [0, 1, 2]
-GATE_OPTIONS = [-0.02, 0.000, 0.005]  # slightly less negative than V4 to reduce whipsaw risk
+GATE_OPTIONS = [-0.02, 0.000, 0.005]
 SPREAD_OPTIONS = [0.001, 0.003, 0.005]
 
 def random_params() -> Params:
@@ -473,13 +452,13 @@ def random_params() -> Params:
         spread_threshold2=random.choice(SPREAD_OPTIONS),
         abs_mom_gate_base=random.choice(GATE_OPTIONS),
         max_weight_min=1.00,
-        max_weight_max=2.50,  # user doesn't care; keep wide
+        max_weight_max=2.50,
         cash_buffer_min=0.00,
-        cash_buffer_max=0.05,  # allow small buffer to help duration
+        cash_buffer_max=0.05,
         universe_mode="EXT",
     )
 
-def mutate(p: Params, rate: float = 0.55) -> Params:
+def mutate(p: Params, rate: float = 0.70) -> Params:
     def flip(cur, opts):
         return random.choice([o for o in opts if o != cur]) if random.random() < rate else cur
     return Params(
@@ -522,27 +501,35 @@ def evolutionary_search(
         data: Dict[str, pd.DataFrame],
         population_size: int = 120,
         generations: int = 220,
-        elite_frac: float = 0.10,
-        mutation_rate: float = 0.55,
+        elite_frac: float = 0.05,
+        mutation_rate: float = 0.70,
         seed: Optional[int] = 42,
+        stagnation_patience: int = 20,
+        min_improve: float = 1e-6,
+        soft_reset_frac: float = 0.30,
 ) -> Tuple[List[Result], Result]:
     if seed is not None:
         random.seed(seed)
         np.random.seed(seed)
+
     pop = [random_params() for _ in range(population_size)]
     results: List[Result] = []
+
+    best_score = -np.inf
+    last_improve_gen = -1
+
+    def fmt_pct(x: float) -> str:
+        return f"{x * 100:.2f}%" if np.isfinite(x) else "nan"
 
     for gen in range(generations):
         gen_results = [evaluate(data, p) for p in pop]
         gen_results.sort(key=lambda r: fitness(r), reverse=True)
         best = gen_results[0]
-
-        def fmt_pct(x: float) -> str:
-            return f"{x * 100:.2f}%" if np.isfinite(x) else "nan"
+        cur_best_score = fitness(best)
 
         print(
             f"[Gen {gen + 1}/{generations}] "
-            f"Score={fitness(best):.2f} | "
+            f"Score={cur_best_score:.2f} | "
             f"CAGR={fmt_pct(best.stats['CAGR'])} vs BTC {fmt_pct(best.bench['CAGR'])} | "
             f"DD={fmt_pct(best.stats['MaxDD'])} | "
             f"DD_Dur={best.stats['MaxDDDuration']:.0f}d | "
@@ -554,6 +541,45 @@ def evolutionary_search(
         )
         results.extend(gen_results)
 
+        if cur_best_score > best_score + min_improve:
+            best_score = cur_best_score
+            last_improve_gen = gen
+
+        # Stagnation check → optional one-time soft reset then exit if still stuck
+        if (gen - last_improve_gen) >= stagnation_patience:
+            print(f"[EarlyStop] Stagnation detected for {stagnation_patience} generations. Best score={best_score:.2f}.")
+            # Soft reset injection
+            inject_n = int(soft_reset_frac * population_size)
+            if inject_n > 0:
+                print(f"[SoftReset] Injecting {inject_n}/{population_size} random individuals.")
+                # Preserve current elite to keep best found so far
+                n_elite = max(1, int(elite_frac * population_size))
+                elite_params = [r.params for r in gen_results[:n_elite]]
+                survivors = [r.params for r in gen_results[n_elite:population_size - inject_n]]
+                new_randoms = [random_params() for _ in range(inject_n)]
+                pop = elite_params + survivors + new_randoms
+
+                # Evaluate one extra generation post-reset
+                post_results = [evaluate(data, p) for p in pop]
+                post_results.sort(key=lambda r: fitness(r), reverse=True)
+                post_best = post_results[0]
+                post_score = fitness(post_best)
+                results.extend(post_results)
+                print(f"[PostReset] Score={post_score:.2f} | CAGR={fmt_pct(post_best.stats['CAGR'])} | DD_Dur={post_best.stats['MaxDDDuration']:.0f}d")
+
+                if post_score > best_score + min_improve:
+                    best_score = post_score
+                    last_improve_gen = gen + 1  # mark improvement
+                else:
+                    print("[EarlyStop] No improvement after soft reset. Exiting.")
+                    results.sort(key=lambda r: fitness(r), reverse=True)
+                    return results, results[0]
+            else:
+                print("[EarlyStop] Exiting without soft reset.")
+                results.sort(key=lambda r: fitness(r), reverse=True)
+                return results, results[0]
+
+        # Regular next-generation construction
         n_elite = max(1, int(elite_frac * population_size))
         elite_params = [r.params for r in gen_results[:n_elite]]
         parent_pool = [r.params for r in gen_results[: max(n_elite * 4, n_elite + 8)]]
@@ -642,9 +668,12 @@ def main():
         data,
         population_size=120,
         generations=220,
-        elite_frac=0.10,
-        mutation_rate=0.55,
+        elite_frac=0.05,
+        mutation_rate=0.70,
         seed=42,
+        stagnation_patience=20,
+        min_improve=1e-6,
+        soft_reset_frac=0.30,
     )
 
     save_results(all_results, best, tag="v4p6_ultra_crypto")
