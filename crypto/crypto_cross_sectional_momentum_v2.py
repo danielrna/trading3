@@ -32,18 +32,18 @@ OUT_DIR = "./out"
 
 # ----------------- AME_V3 (light) — Best Params (frozen) ----------------- #
 UNIVERSE_MODE = "EXT"                # "BASE" or "EXT"
-LOOKBACKS: Tuple[int,int,int] = (42, 14, 7)
-LOOKBACK_WEIGHTS: Tuple[float,float,float] = (0.4, 0.4, 0.2)
+LOOKBACKS = (21, 14, 7)
+LOOKBACK_WEIGHTS = (0.4, 0.4, 0.2)
 SKIP_RECENT_DAYS = 0
-REBALANCE_FREQ = "D"                 # "D" | "W" | "2W" | "M"
+REBALANCE_FREQ = "W"
 
 N_POSITIONS_BASE = 1
 ALLOW_TWO_WHEN_SPREAD = True
 ALLOW_THREE_WHEN_SPREAD = True
-SPREAD_THRESHOLD1 = 0.01             # enable #2 if top1 - top2 >= 1.0%
+SPREAD_THRESHOLD1 = 0.01
 SPREAD_THRESHOLD2 = 0.0075           # enable #3 if top2 - top3 >= 0.75%
 
-ABS_MOM_GATE_BASE = 0.003            # 0.30% absolute gate
+ABS_MOM_GATE_BASE = 0.005
 ABS_MOM_GATE_SCALE_VOL = False       # scaling disabled (frozen)
 
 MAX_WEIGHT_MIN = 0.80                # dynamic cap floor (via spread)
